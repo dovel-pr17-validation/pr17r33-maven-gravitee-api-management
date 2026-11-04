@@ -1,0 +1,801 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.reactor;
+
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_TRACING_ROOT_SPAN;
+import static io.gravitee.gateway.reactive.http.vertx.VertxHttpServerRequest.NETTY_ATTR_CONNECTION_TIME;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.anyLong;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.gravitee.common.http.IdGenerator;
+import io.gravitee.gateway.api.ExecutionContext;
+import io.gravitee.gateway.api.handler.Handler;
+import io.gravitee.gateway.core.component.ComponentProvider;
+import io.gravitee.gateway.core.invoker.V3InvokerAttributes;
+import io.gravitee.gateway.core.processor.provider.ProcessorProviderChain;
+import io.gravitee.gateway.env.GatewayConfiguration;
+import io.gravitee.gateway.env.RequestClientAuthConfiguration;
+import io.gravitee.gateway.env.RequestPathConfiguration;
+import io.gravitee.gateway.env.RequestPathHandling;
+import io.gravitee.gateway.env.RequestTimeoutConfiguration;
+import io.gravitee.gateway.opentelemetry.TracingContext;
+import io.gravitee.gateway.reactive.core.context.HttpExecutionContextInternal;
+import io.gravitee.gateway.reactive.core.context.MutableExecutionContext;
+import io.gravitee.gateway.reactive.core.processor.ProcessorChain;
+import io.gravitee.gateway.reactive.http.vertx.ClientCloseClassifier;
+import io.gravitee.gateway.reactive.reactor.handler.HttpAcceptorResolver;
+import io.gravitee.gateway.reactive.reactor.path.RequestPathRejection;
+import io.gravitee.gateway.reactive.reactor.processor.DefaultPlatformProcessorChainFactory;
+import io.gravitee.gateway.reactive.reactor.processor.NotFoundProcessorChainFactory;
+import io.gravitee.gateway.reactor.handler.HttpAcceptor;
+import io.gravitee.gateway.reactor.handler.ReactorHandler;
+import io.gravitee.gateway.reactor.processor.RequestProcessorChainFactory;
+import io.gravitee.gateway.reactor.processor.ResponseProcessorChainFactory;
+import io.gravitee.gateway.report.ReporterService;
+import io.gravitee.node.api.Node;
+import io.gravitee.node.api.opentelemetry.Span;
+import io.gravitee.node.opentelemetry.OpenTelemetryFactory;
+import io.gravitee.node.opentelemetry.tracer.noop.NoOpTracer;
+import io.gravitee.reporter.api.v4.metric.Metrics;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.disposables.Disposable;
+import io.reactivex.rxjava3.observers.TestObserver;
+import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.MultiMap;
+import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.HttpVersion;
+import io.vertx.core.http.impl.HttpServerConnection;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.net.HostAndPort;
+import io.vertx.rxjava3.core.http.HttpConnection;
+import io.vertx.rxjava3.core.http.HttpServerRequest;
+import io.vertx.rxjava3.core.http.HttpServerResponse;
+import java.io.IOException;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.helpers.NOPLogger;
+import org.springframework.core.env.Environment;
+
+/**
+ * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@ExtendWith(MockitoExtension.class)
+class DefaultHttpRequestDispatcherTest {
+
+    protected static final String HOST = "gravitee.io";
+    protected static final int PORT = -1;
+    protected static final String PATH = "/path";
+    // AbstractHttpAcceptor always appends a trailing slash; the real acceptor never returns PATH as-is.
+    protected static final String ACCEPTOR_PATH = "/path/";
+    protected static final String MOCK_ERROR_MESSAGE = "Mock error";
+    public static final String SERVER_ID = null;
+
+    @Spy
+    private final Vertx vertx = Vertx.vertx();
+
+    @Mock
+    private Node node;
+
+    @Mock
+    private GatewayConfiguration gatewayConfiguration;
+
+    @Mock
+    private HttpAcceptorResolver httpAcceptorResolver;
+
+    @Mock
+    private IdGenerator idGenerator;
+
+    @Mock
+    private RequestProcessorChainFactory requestProcessorChainFactory;
+
+    @Mock
+    private ResponseProcessorChainFactory responseProcessorChainFactory;
+
+    @Mock
+    private DefaultPlatformProcessorChainFactory platformProcessorChainFactory;
+
+    @Mock
+    private NotFoundProcessorChainFactory notFoundProcessorChainFactory;
+
+    @Mock
+    private HttpServerRequest rxRequest;
+
+    @Mock
+    private HttpServerResponse rxResponse;
+
+    @Mock
+    private io.vertx.core.http.HttpServerRequest request;
+
+    @Mock
+    private io.vertx.core.http.HttpServerResponse response;
+
+    @Mock
+    private HttpAcceptor handlerEntrypoint;
+
+    @Mock
+    private Environment environment;
+
+    @Mock
+    private ReporterService reporterService;
+
+    @Mock
+    private ComponentProvider globalComponentProvider;
+
+    @Mock
+    private RequestTimeoutConfiguration requestTimeoutConfiguration;
+
+    @Mock
+    private OpenTelemetryFactory openTelemetryFactory;
+
+    @Mock
+    private RequestClientAuthConfiguration requestClientAuthConfiguration;
+
+    private DefaultHttpRequestDispatcher cut;
+    private NoOpTracer spyNoopTracer;
+    private TracingContext tracingContext;
+
+    @BeforeEach
+    public void init() {
+        // Mock vertx request behavior.
+        lenient().when(rxRequest.authority()).thenReturn(HostAndPort.create(HOST, PORT));
+        lenient().when(rxRequest.path()).thenReturn(PATH);
+        lenient().when(rxRequest.version()).thenReturn(HttpVersion.HTTP_2);
+        lenient().when(rxRequest.method()).thenReturn(HttpMethod.GET);
+        lenient().when(rxRequest.headers()).thenReturn(MultiMap.caseInsensitiveMultiMap());
+        lenient().when(rxRequest.toFlowable()).thenReturn(Flowable.empty());
+        lenient().when(rxRequest.response()).thenReturn(rxResponse);
+        lenient().when(rxRequest.getDelegate()).thenReturn(request);
+
+        lenient().when(request.authority()).thenReturn(HostAndPort.create(HOST, PORT));
+        lenient().when(request.path()).thenReturn(PATH);
+        lenient().when(request.method()).thenReturn(HttpMethod.GET);
+        lenient().when(request.headers()).thenReturn(io.vertx.core.MultiMap.caseInsensitiveMultiMap());
+        lenient().when(request.response()).thenReturn(response);
+
+        // Mock vertx response behavior.
+        lenient().when(rxResponse.headers()).thenReturn(MultiMap.caseInsensitiveMultiMap());
+        lenient().when(rxResponse.trailers()).thenReturn(MultiMap.caseInsensitiveMultiMap());
+        lenient().when(rxResponse.getDelegate()).thenReturn(response);
+
+        lenient().when(response.headers()).thenReturn(io.vertx.core.MultiMap.caseInsensitiveMultiMap());
+        lenient().when(response.trailers()).thenReturn(io.vertx.core.MultiMap.caseInsensitiveMultiMap());
+        lenient().when(response.end()).thenReturn(Future.succeededFuture());
+
+        lenient().when(requestProcessorChainFactory.create()).thenReturn(new ProcessorProviderChain<>(List.of()));
+        lenient().when(responseProcessorChainFactory.create()).thenReturn(new ProcessorProviderChain<>(List.of()));
+        lenient().when(platformProcessorChainFactory.preProcessorChain()).thenReturn(new ProcessorChain("pre", List.of()));
+        lenient().when(platformProcessorChainFactory.postProcessorChain()).thenReturn(new ProcessorChain("post", List.of()));
+        lenient().when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(0L);
+        lenient().when(requestTimeoutConfiguration.getRequestTimeoutGraceDelay()).thenReturn(10L);
+
+        lenient().when(globalComponentProvider.getComponent(Node.class)).thenReturn(node);
+        mockConnectionCreationTimestamp();
+
+        spyNoopTracer = spy(new NoOpTracer());
+        tracingContext = new TracingContext(spyNoopTracer, true, false);
+        cut = new DefaultHttpRequestDispatcher(
+            gatewayConfiguration,
+            httpAcceptorResolver,
+            idGenerator,
+            globalComponentProvider,
+            new RequestProcessorChainFactory(),
+            responseProcessorChainFactory,
+            platformProcessorChainFactory,
+            notFoundProcessorChainFactory,
+            tracingContext,
+            requestTimeoutConfiguration,
+            requestClientAuthConfiguration,
+            new RequestPathConfiguration(RequestPathHandling.RAW),
+            vertx,
+            true
+        );
+        //TODO: to check: is this needed ?
+        // cut.setApplicationContext(mock(ApplicationContext.class));
+    }
+
+    private void mockConnectionCreationTimestamp() {
+        HttpConnection httpConnection = mock(HttpConnection.class);
+        HttpServerConnection httpServerConnection = mock(HttpServerConnection.class);
+        Channel channel = mock(Channel.class);
+        ChannelHandlerContext channelHandlerContext = mock(ChannelHandlerContext.class);
+        Attribute attribute = mock(Attribute.class);
+
+        lenient().when(rxRequest.connection()).thenReturn(httpConnection);
+        lenient().when(httpConnection.getDelegate()).thenReturn(httpServerConnection);
+        lenient().when(httpServerConnection.channelHandlerContext()).thenReturn(channelHandlerContext);
+        lenient().when(channelHandlerContext.channel()).thenReturn(channel);
+        lenient().when(channel.attr(AttributeKey.valueOf(NETTY_ATTR_CONNECTION_TIME))).thenReturn(attribute);
+        lenient().when(attribute.get()).thenReturn(System.currentTimeMillis());
+    }
+
+    /**
+     * Which paths the dispatcher refuses, checked against an oracle rather than against itself.
+     *
+     * <p>{@code dispatch} decides inline whether a path is refused, inside the single scan it
+     * already pays for. {@link RequestPathRejection#applies} states the same rule a second time,
+     * written independently and living in the test tree because nothing in production calls it.
+     * This drives the <b>dispatcher</b> over a table of modes and paths and asserts it refused
+     * exactly what the oracle announces.
+     *
+     * <p>The independence is the whole point. An oracle derived from the production code — asserting
+     * the predicate against the normalizer it is built from, as an earlier version of this did —
+     * passes whatever the dispatcher does. This table is what caught {@code OPTIONS *} and the null
+     * target being refused when they should be dispatched.
+     */
+    @Nested
+    @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+    class The_rejection_decision {
+
+        /**
+         * One table, walked by both readings. Every path that is refused under some mode, and a few
+         * that never are, so a predicate stuck on {@code true} fails too.
+         */
+        static Stream<Arguments> modesAndPaths() {
+            final String[] paths = {
+                "/alpha/api/echo",
+                "/alpha/api/../../beta/api/echo",
+                "/alpha/api/%2e%2e/%2e%2e/beta",
+                "/alpha/api/..;/..;/beta",
+                "/alpha/api/%zz",
+                "/alpha/api/%+41",
+                "/alpha//api/echo",
+                "/",
+                // Request targets that are not origin-form paths. They must be dispatched, not
+                // refused, whatever the mode: OPTIONS * is legal and a null target is what an
+                // HTTP/2 stream without a :path pseudo-header produces.
+                "*",
+                null,
+            };
+            return Stream.of(RequestPathHandling.values()).flatMap(mode -> Stream.of(paths).map(path -> Arguments.of(mode, path)));
+        }
+
+        @ParameterizedTest(name = "{0} on {1}")
+        @MethodSource("modesAndPaths")
+        void should_be_the_one_the_predicate_announces(RequestPathHandling mode, String path) {
+            // Given a dispatcher in that mode, and nothing to route to — the acceptor is irrelevant
+            // here, since the decision under test is taken before it is consulted.
+            final RequestPathConfiguration configuration = new RequestPathConfiguration(mode);
+            when(rxRequest.path()).thenReturn(path);
+            lenient().when(httpAcceptorResolver.resolve(any(), any(), any())).thenReturn(null);
+            lenient().when(notFoundProcessorChainFactory.processorChain()).thenReturn(new ProcessorChain("not-found", List.of()));
+            lenient()
+                .when(notFoundProcessorChainFactory.rejectedPathProcessorChain())
+                .thenReturn(new ProcessorChain("rejected", List.of()));
+
+            // When the request is dispatched.
+            dispatcherWith(configuration).dispatch(rxRequest, SERVER_ID).test().awaitDone(10, TimeUnit.SECONDS);
+
+            // Then the rejected chain was reached exactly when the predicate said it would be.
+            final boolean predicted = RequestPathRejection.applies(configuration, path);
+            verify(notFoundProcessorChainFactory, times(predicted ? 1 : 0)).rejectedPathProcessorChain();
+        }
+
+        private DefaultHttpRequestDispatcher dispatcherWith(final RequestPathConfiguration configuration) {
+            return new DefaultHttpRequestDispatcher(
+                gatewayConfiguration,
+                httpAcceptorResolver,
+                idGenerator,
+                globalComponentProvider,
+                new RequestProcessorChainFactory(),
+                responseProcessorChainFactory,
+                platformProcessorChainFactory,
+                notFoundProcessorChainFactory,
+                tracingContext,
+                requestTimeoutConfiguration,
+                requestClientAuthConfiguration,
+                configuration,
+                vertx,
+                true
+            );
+        }
+    }
+
+    @Nested
+    class V2EmulatedApiReactor {
+
+        @Mock
+        private ApiReactor apiReactor;
+
+        @BeforeEach
+        public void prepareV4EmulationMock() {
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(handlerEntrypoint);
+            when(handlerEntrypoint.path()).thenReturn(ACCEPTOR_PATH);
+            when(handlerEntrypoint.reactor()).thenReturn(apiReactor);
+            when(apiReactor.tracingContext()).thenReturn(tracingContext);
+        }
+
+        @Test
+        void shouldHandleV4EmulationRequest() {
+            when(apiReactor.handle(any(MutableExecutionContext.class))).thenReturn(Completable.complete());
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertResult();
+        }
+
+        @Test
+        void shouldPropagateErrorWhenErrorWithV4EmulationRequest() {
+            when(apiReactor.handle(any(MutableExecutionContext.class))).thenReturn(
+                Completable.error(new RuntimeException(MOCK_ERROR_MESSAGE))
+            );
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertError(RuntimeException.class);
+            obs.assertError(t -> MOCK_ERROR_MESSAGE.equals(t.getMessage()));
+        }
+
+        @Test
+        void shouldInitiateTracingV4EmulationRequest() {
+            when(
+                apiReactor.handle(
+                    argThat(ctx -> {
+                        assertThat(ctx.<Span>getInternalAttribute(ATTR_INTERNAL_TRACING_ROOT_SPAN)).isNotNull();
+                        return true;
+                    })
+                )
+            ).thenReturn(Completable.complete());
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+            verify(spyNoopTracer).startRootSpanFrom(any(), any());
+            verify(spyNoopTracer, timeout(1000)).endWithResponseAndError(any(), any(), any(), eq((Throwable) null));
+        }
+
+        @Test
+        void shouldUseStableRouteAsTracingSpanNameOnV4EmulationRequest() {
+            when(apiReactor.handle(any(MutableExecutionContext.class))).thenReturn(Completable.complete());
+            ArgumentCaptor<Context> vertxContextCaptor = ArgumentCaptor.forClass(Context.class);
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+
+            verify(spyNoopTracer).startRootSpanFrom(vertxContextCaptor.capture(), any());
+            assertThat(((ContextInternal) vertxContextCaptor.getValue()).<String>getLocal("VertxRoute")).isEqualTo(PATH);
+        }
+
+        @Test
+        void shouldEndTracingSpanInErrorWhenExceptionOnV4EmulationRequest() {
+            when(
+                apiReactor.handle(
+                    argThat(ctx -> {
+                        assertThat(ctx.<Span>getInternalAttribute(ATTR_INTERNAL_TRACING_ROOT_SPAN)).isNotNull();
+                        return true;
+                    })
+                )
+            ).thenReturn(Completable.error(new RuntimeException(MOCK_ERROR_MESSAGE)));
+
+            cut
+                .dispatch(rxRequest, SERVER_ID)
+                .test()
+                .assertError(RuntimeException.class)
+                .assertError(t -> MOCK_ERROR_MESSAGE.equals(t.getMessage()));
+            verify(spyNoopTracer).startRootSpanFrom(any(), any());
+            verify(spyNoopTracer, timeout(1000)).endWithResponseAndError(any(), any(), any(), any(Throwable.class));
+        }
+
+        @Test
+        void shouldEndTracingSpanInErrorWhenTheClientAbortedTheResponseStream() {
+            // The write failure is swallowed by VertxHttpServerResponse, so the dispatch completes normally and the
+            // span would otherwise be closed on the response code alone - a 200 for a stream that never finished.
+            final IOException clientClose = new IOException("Connection reset by peer");
+            when(apiReactor.handle(any(MutableExecutionContext.class))).thenAnswer(invocation -> {
+                MutableExecutionContext ctx = invocation.getArgument(0);
+                ctx.metrics(Metrics.builder().build());
+                ClientCloseClassifier.decorate(ctx, clientClose);
+                return Completable.complete();
+            });
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+
+            ArgumentCaptor<Throwable> endedWith = ArgumentCaptor.forClass(Throwable.class);
+            verify(spyNoopTracer, timeout(1000)).endWithResponseAndError(any(), any(), any(), endedWith.capture());
+            assertThat(endedWith.getValue()).isSameAs(clientClose);
+        }
+    }
+
+    @Nested
+    class V2ApiReactor {
+
+        @Mock
+        private ReactorHandler apiReactor;
+
+        @BeforeEach
+        public void prepareV2ApiReactor() {
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(handlerEntrypoint);
+            when(handlerEntrypoint.path()).thenReturn(ACCEPTOR_PATH);
+            when(handlerEntrypoint.reactor()).thenReturn(apiReactor);
+            when(apiReactor.tracingContext()).thenReturn(tracingContext);
+            mockConnectionCreationTimestamp();
+        }
+
+        @Test
+        void shouldHandleV3Request() {
+            when(response.ended()).thenReturn(true);
+
+            doAnswer(i -> {
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            verify(vertx, never()).setTimer(anyLong(), any());
+            verify(vertx, never()).cancelTimer(anyLong());
+
+            obs.assertResult();
+        }
+
+        @Test
+        void shouldHandleV3RequestWithTimeout() {
+            long vertxTimerId = 125366;
+            long timeout = 57;
+
+            doReturn(vertxTimerId).when(vertx).setTimer(anyLong(), any());
+            when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(timeout);
+
+            when(response.ended()).thenReturn(true);
+            final ArgumentCaptor<ExecutionContext> ctxCaptor = ArgumentCaptor.forClass(ExecutionContext.class);
+
+            doAnswer(i -> {
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(ctxCaptor.capture(), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            verify(vertx).setTimer(eq(timeout), any());
+            verify(vertx).cancelTimer(vertxTimerId);
+
+            obs.assertResult();
+        }
+
+        @Test
+        void shouldSetMetricsWhenHandlingV3Request() {
+            when(gatewayConfiguration.tenant()).thenReturn(Optional.of("TENANT"));
+            when(gatewayConfiguration.zone()).thenReturn(Optional.of("ZONE"));
+            when(response.ended()).thenReturn(true);
+
+            doAnswer(i -> {
+                final ExecutionContext ctx = i.getArgument(0, ExecutionContext.class);
+
+                assertEquals("TENANT", ctx.request().metrics().getTenant());
+                assertEquals("ZONE", ctx.request().metrics().getZone());
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertResult();
+        }
+
+        @Test
+        void shouldEndResponseWhenNotAlreadyEndedByV3Handler() {
+            when(gatewayConfiguration.tenant()).thenReturn(Optional.of("TENANT"));
+            when(gatewayConfiguration.zone()).thenReturn(Optional.of("ZONE"));
+            when(response.ended()).thenReturn(false);
+            when(rxResponse.rxEnd()).thenReturn(Completable.complete());
+
+            doAnswer(i -> {
+                final ExecutionContext ctx = i.getArgument(0, ExecutionContext.class);
+
+                assertEquals("TENANT", ctx.request().metrics().getTenant());
+                assertEquals("ZONE", ctx.request().metrics().getZone());
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertResult();
+        }
+
+        @Test
+        void shouldEndResponseWhenClientConnexionIsClosed() {
+            when(gatewayConfiguration.tenant()).thenReturn(Optional.of("TENANT"));
+            when(gatewayConfiguration.zone()).thenReturn(Optional.of("ZONE"));
+            when(response.ended()).thenReturn(false);
+            when(rxResponse.rxEnd()).thenReturn(Completable.error(new RuntimeException()));
+
+            doAnswer(i -> {
+                final ExecutionContext ctx = i.getArgument(0, ExecutionContext.class);
+
+                assertEquals("TENANT", ctx.request().metrics().getTenant());
+                assertEquals("ZONE", ctx.request().metrics().getZone());
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            cut
+                .dispatch(rxRequest, SERVER_ID)
+                // Simulate when the client is ending the connection before the gateway got a response from the endpoint
+                .doOnSubscribe(Disposable::dispose)
+                .test()
+                .assertNoErrors();
+        }
+
+        @Test
+        void shouldCancelUpstreamWhenClientConnectionIsClosedBeforeV3ExchangeEnds() {
+            when(response.ended()).thenReturn(false);
+            final Runnable cancelUpstream = mock(Runnable.class);
+
+            doAnswer(i -> {
+                i.getArgument(0, ExecutionContext.class).setAttribute(V3InvokerAttributes.ATTR_INTERNAL_V3_CANCEL_UPSTREAM, cancelUpstream);
+                // The upstream never answers: only the client going away ends the exchange
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            cut.dispatch(rxRequest, SERVER_ID).test().dispose();
+
+            verify(cancelUpstream).run();
+        }
+
+        @Test
+        void shouldNotCancelUpstreamWhenV3ExchangeHasEnded() {
+            when(response.ended()).thenReturn(true);
+            final Runnable cancelUpstream = mock(Runnable.class);
+
+            doAnswer(i -> {
+                i.getArgument(0, ExecutionContext.class).setAttribute(V3InvokerAttributes.ATTR_INTERNAL_V3_CANCEL_UPSTREAM, cancelUpstream);
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertResult();
+
+            verify(cancelUpstream, never()).run();
+        }
+
+        @Test
+        void shouldPropagateErrorWhenExceptionWithV3Request() {
+            doThrow(new RuntimeException(MOCK_ERROR_MESSAGE)).when(apiReactor).handle(any(ExecutionContext.class), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertError(RuntimeException.class);
+            obs.assertError(t -> MOCK_ERROR_MESSAGE.equals(t.getMessage()));
+        }
+
+        @Test
+        void shouldInitiateTracingV3Request() {
+            when(response.ended()).thenReturn(true);
+
+            doAnswer(i -> {
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(
+                    argThat(ctx -> {
+                        assertThat(ctx.getAttribute(ATTR_INTERNAL_TRACING_ROOT_SPAN)).isNotNull();
+                        return true;
+                    }),
+                    any(Handler.class)
+                );
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+            verify(spyNoopTracer).startRootSpanFrom(any(), any());
+            verify(spyNoopTracer, timeout(1000)).endWithResponse(any(), any(), any());
+        }
+
+        @Test
+        void shouldUseStableRouteAsTracingSpanNameOnV3Request() {
+            when(response.ended()).thenReturn(true);
+
+            doAnswer(i -> {
+                simulateEndHandlerCall(i);
+                return null;
+            })
+                .when(apiReactor)
+                .handle(any(ExecutionContext.class), any(Handler.class));
+
+            ArgumentCaptor<Context> vertxContextCaptor = ArgumentCaptor.forClass(Context.class);
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+
+            verify(spyNoopTracer).startRootSpanFrom(vertxContextCaptor.capture(), any());
+            assertThat(((ContextInternal) vertxContextCaptor.getValue()).<String>getLocal("VertxRoute")).isEqualTo(PATH);
+        }
+
+        @Test
+        void shouldEndSpanInErrorWhenExceptionWithV3Request() {
+            doThrow(new RuntimeException(MOCK_ERROR_MESSAGE)).when(apiReactor).handle(any(ExecutionContext.class), any(Handler.class));
+
+            final TestObserver<Void> obs = cut.dispatch(rxRequest, SERVER_ID).test();
+
+            obs.assertError(RuntimeException.class);
+            obs.assertError(t -> MOCK_ERROR_MESSAGE.equals(t.getMessage()));
+
+            verify(spyNoopTracer).startRootSpanFrom(any(), any());
+            verify(spyNoopTracer, timeout(1000)).endWithResponseAndError(any(), any(), any(), any(Throwable.class));
+        }
+    }
+
+    @Nested
+    class NotFoundApiReactor {
+
+        @Test
+        void shouldHandleNotFoundWhenNoHandlerResolved() {
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(null);
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertResult();
+
+            verify(notFoundProcessorChainFactory).processorChain();
+            verify(processorChain).execute(any(), any());
+        }
+
+        @Test
+        void should_take_the_timing_origin_before_the_acceptor_is_resolved() {
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            final AtomicLong resolvedAtNs = new AtomicLong();
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenAnswer(invocation -> {
+                resolvedAtNs.set(System.nanoTime());
+                return null;
+            });
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertResult();
+
+            final ArgumentCaptor<HttpExecutionContextInternal> ctx = ArgumentCaptor.forClass(HttpExecutionContextInternal.class);
+            verify(processorChain).execute(ctx.capture(), any());
+            // The origin every duration is measured from has to predate the work the dispatcher does — the path scan,
+            // the normalization, this very lookup. Taken in the request wrapper's constructor it would come after, and
+            // every reported latency would silently exclude it.
+            assertThat(ctx.getValue().request().timestampNs()).isLessThan(resolvedAtNs.get());
+        }
+
+        @Test
+        void shouldHandleNotFoundWhenNoTargetOnResolvedHandler() {
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(null);
+
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(null);
+            cut.dispatch(rxRequest, SERVER_ID).test().assertResult();
+
+            verify(notFoundProcessorChainFactory).processorChain();
+            verify(processorChain).execute(any(), any());
+        }
+
+        @Test
+        void should_resolve_with_a_null_host_when_the_request_carries_no_host_header() {
+            // A request without a Host header (nor an HTTP/2 :authority pseudo-header) has a null authority.
+            when(rxRequest.authority()).thenReturn(null);
+
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            when(httpAcceptorResolver.resolve(null, PATH, SERVER_ID)).thenReturn(null);
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertResult();
+
+            verify(httpAcceptorResolver).resolve(null, PATH, SERVER_ID);
+        }
+
+        @Test
+        void shouldInitiateTracingWhenNotFoundAPI() {
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(null);
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+            verify(spyNoopTracer).startRootSpanFrom(any(), any());
+            verify(spyNoopTracer, timeout(1000)).endWithResponseAndError(any(), any(), any(), eq((Throwable) null));
+        }
+
+        @Test
+        void shouldUseStableRouteAsTracingSpanNameOnNotFoundRequest() {
+            ProcessorChain processorChain = spy(new ProcessorChain("id", List.of()));
+            when(notFoundProcessorChainFactory.processorChain()).thenReturn(processorChain);
+            when(httpAcceptorResolver.resolve(HOST, PATH, SERVER_ID)).thenReturn(null);
+            ArgumentCaptor<Context> vertxContextCaptor = ArgumentCaptor.forClass(Context.class);
+
+            cut.dispatch(rxRequest, SERVER_ID).test().assertComplete();
+
+            verify(spyNoopTracer).startRootSpanFrom(vertxContextCaptor.capture(), any());
+            assertThat(((ContextInternal) vertxContextCaptor.getValue()).<String>getLocal("VertxRoute")).isEqualTo("/");
+        }
+    }
+
+    private void simulateEndHandlerCall(InvocationOnMock i) {
+        final ExecutionContext ctx = i.getArgument(0);
+        final Handler<ExecutionContext> endHandler = i.getArgument(1, Handler.class);
+        endHandler.handle(ctx);
+    }
+
+    @Nested
+    class ClassifyResponseStreamError {
+
+        @Test
+        void should_decorate_when_throwable_is_a_client_close() {
+            MutableExecutionContext ctx = mock(MutableExecutionContext.class);
+            Metrics metrics = Metrics.builder().build();
+            lenient().when(ctx.metrics()).thenReturn(metrics);
+            lenient().when(ctx.withLogger(any())).thenReturn(NOPLogger.NOP_LOGGER);
+
+            DefaultHttpRequestDispatcher.classifyResponseStreamError(ctx, new IOException("Connection reset by peer"));
+
+            assertThat(metrics.getErrorKey()).isEqualTo(ClientCloseClassifier.CLIENT_ABORTED_TCP_RESET);
+        }
+
+        @Test
+        void should_not_decorate_when_throwable_is_not_a_client_close() {
+            // A genuine gateway-side fault must NOT be mislabeled as a 499 client abort (C1 / APIM-12769).
+            MutableExecutionContext ctx = mock(MutableExecutionContext.class);
+            Metrics metrics = Metrics.builder().build();
+            lenient().when(ctx.metrics()).thenReturn(metrics);
+            lenient().when(ctx.withLogger(any())).thenReturn(NOPLogger.NOP_LOGGER);
+
+            DefaultHttpRequestDispatcher.classifyResponseStreamError(ctx, new RuntimeException("boom: a real gateway defect"));
+
+            assertThat(metrics.getErrorKey()).isNull();
+            assertThat(metrics.getFailure()).isNull();
+        }
+    }
+}

@@ -1,0 +1,250 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.common.deployer;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import io.gravitee.gateway.services.sync.process.common.model.SyncAction;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEnginePort;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEntityReactorDeployable;
+import io.reactivex.rxjava3.core.Completable;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+class AuthzEntityDeployerTest {
+
+    private RecordingPort port;
+    private AuthzEntityDeployer deployer;
+
+    @BeforeEach
+    void setUp() {
+        port = new RecordingPort();
+        deployer = new AuthzEntityDeployer(
+            port,
+            new io.gravitee.gateway.services.sync.process.distributed.service.NoopDistributedSyncService()
+        );
+    }
+
+    @Test
+    void deploy_principal_is_unconditional_broadcast() {
+        AuthzEntityReactorDeployable d = principal("idp.am.alice");
+
+        deployer.deploy(d).blockingAwait();
+
+        assertThat(port.entityOps).hasSize(1);
+        assertThat(port.entityOps.peek().op()).isEqualTo("addOrUpdateEntity");
+        assertThat(port.entityOps.peek().uid()).isEqualTo("Principal::\"idp.am.alice\"");
+    }
+
+    @Test
+    void deploy_auto_derived_resource_is_staged_unconditionally() {
+        AuthzEntityReactorDeployable d = resource("api.bookings");
+
+        deployer.deploy(d).blockingAwait();
+
+        assertThat(port.entityOps).hasSize(1);
+        assertThat(port.entityOps.peek().uid()).isEqualTo("Resource::\"api.bookings\"");
+    }
+
+    @Test
+    void deploy_custom_resource_entity_broadcasts_unconditionally() {
+        // Non-auto-derived RESOURCE entities aren't tied to any API and must land on
+        // every gateway node regardless of which APIs the registry knows about.
+        AuthzEntityReactorDeployable d = resource("team.acme.docs");
+
+        deployer.deploy(d).blockingAwait();
+
+        assertThat(port.entityOps).hasSize(1);
+        assertThat(port.entityOps.peek().uid()).isEqualTo("Resource::\"team.acme.docs\"");
+    }
+
+    @Test
+    void undeploy_does_not_filter_by_registry() {
+        AuthzEntityReactorDeployable d = AuthzEntityReactorDeployable.builder()
+            .entityId("api.bookings")
+            .engineUid("Resource::\"api.bookings\"")
+            .kind(AuthzEntityReactorDeployable.Kind.RESOURCE)
+            .syncAction(SyncAction.UNDEPLOY)
+            .build();
+
+        deployer.undeploy(d).blockingAwait();
+
+        assertThat(port.entityOps).hasSize(1);
+        assertThat(port.entityOps.peek().op()).isEqualTo("removeEntity");
+    }
+
+    @Test
+    void deploy_forwards_attributes_and_parents_to_the_engine_port() {
+        AuthzEntityReactorDeployable d = AuthzEntityReactorDeployable.builder()
+            .entityId("api.bookings")
+            .engineUid("Resource::\"api.bookings\"")
+            .kind(AuthzEntityReactorDeployable.Kind.RESOURCE)
+            .attributes(Map.of("region", "eu"))
+            .parents(List.of("Resource::\"api.parent\""))
+            .syncAction(SyncAction.DEPLOY)
+            .build();
+
+        deployer.deploy(d).blockingAwait();
+
+        RecordingPort.EntityOp op = port.entityOps.peek();
+        assertThat(op.attributes()).containsEntry("region", "eu");
+        assertThat(op.parents()).containsExactly("Resource::\"api.parent\"");
+    }
+
+    @Test
+    void deploy_evicts_dropped_scopes_before_re_staging_targets() {
+        AuthzEntityReactorDeployable d = AuthzEntityReactorDeployable.builder()
+            .entityId("api.bookings")
+            .engineUid("Resource::\"api.bookings\"")
+            .kind(AuthzEntityReactorDeployable.Kind.RESOURCE)
+            .targetPdpIds(Set.of("scope-b"))
+            .removedTargetPdpIds(Set.of("scope-a"))
+            .syncAction(SyncAction.DEPLOY)
+            .build();
+
+        deployer.deploy(d).blockingAwait();
+
+        List<RecordingPort.EntityOp> ops = new java.util.ArrayList<>(port.entityOps);
+        assertThat(ops).hasSize(2);
+        assertThat(ops.get(0).op()).isEqualTo("removeEntity");
+        assertThat(ops.get(0).targetPdpIds()).isEqualTo(Set.of("scope-a"));
+        assertThat(ops.get(1).op()).isEqualTo("addOrUpdateEntity");
+        assertThat(ops.get(1).targetPdpIds()).isEqualTo(Set.of("scope-b"));
+    }
+
+    @Test
+    void deploy_with_no_dropped_scopes_skips_removal() {
+        AuthzEntityReactorDeployable d = resource("api.bookings");
+
+        deployer.deploy(d).blockingAwait();
+
+        assertThat(port.entityOps).hasSize(1);
+        assertThat(port.entityOps.peek().op()).isEqualTo("addOrUpdateEntity");
+    }
+
+    private static AuthzEntityReactorDeployable principal(String entityId) {
+        return AuthzEntityReactorDeployable.builder()
+            .entityId(entityId)
+            .engineUid("Principal::\"" + entityId + "\"")
+            .kind(AuthzEntityReactorDeployable.Kind.PRINCIPAL)
+            .syncAction(SyncAction.DEPLOY)
+            .build();
+    }
+
+    private static AuthzEntityReactorDeployable resource(String entityId) {
+        return AuthzEntityReactorDeployable.builder()
+            .entityId(entityId)
+            .engineUid("Resource::\"" + entityId + "\"")
+            .kind(AuthzEntityReactorDeployable.Kind.RESOURCE)
+            .syncAction(SyncAction.DEPLOY)
+            .build();
+    }
+
+    @Test
+    void deploying_and_undeploying_an_entity_never_reaches_the_schema_ops() {
+        AuthzEntityReactorDeployable d = principal("idp.am.alice");
+
+        deployer.deploy(d).blockingAwait();
+        deployer.undeploy(d).blockingAwait();
+
+        assertThat(port.entityOps).isNotEmpty();
+        assertThat(port.schemaOps).as("the schema route is separate; an entity must never stage a schema").isEmpty();
+
+        // The assertion above is only worth anything if the recorder actually records; prove it here,
+        // otherwise gutting the recorder would leave the guard silently green.
+        port.addOrUpdateSchema("env-1", "probe", "n", "entity User;", Set.of("orders"), 1L).blockingAwait();
+        assertThat(port.schemaOps).containsExactly("addOrUpdateSchema:probe");
+    }
+
+    private static class RecordingPort implements AuthzEnginePort {
+
+        record EntityOp(String op, String uid, Map<String, Object> attributes, List<String> parents, Set<String> targetPdpIds) {}
+
+        final ConcurrentLinkedQueue<EntityOp> entityOps = new ConcurrentLinkedQueue<>();
+
+        @Override
+        public Completable addOrUpdateEntity(
+            String environmentId,
+            String uid,
+            Map<String, Object> attributes,
+            List<String> parents,
+            Set<String> targetPdpIds,
+            long updatedAt
+        ) {
+            entityOps.add(new EntityOp("addOrUpdateEntity", uid, attributes, parents, targetPdpIds));
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable removeEntity(String environmentId, String uid, Set<String> targetPdpIds) {
+            entityOps.add(new EntityOp("removeEntity", uid, null, null, targetPdpIds));
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable addOrUpdatePolicy(
+            String environmentId,
+            String docId,
+            String name,
+            String policyText,
+            Set<String> targetPdpIds,
+            long updatedAt,
+            String revision
+        ) {
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable removePolicy(String environmentId, String docId, Set<String> targetPdpIds) {
+            return Completable.complete();
+        }
+
+        final ConcurrentLinkedQueue<String> schemaOps = new ConcurrentLinkedQueue<>();
+
+        @Override
+        public Completable addOrUpdateSchema(
+            String environmentId,
+            String docId,
+            String name,
+            String schemaText,
+            Set<String> targetPdpIds,
+            long updatedAt
+        ) {
+            schemaOps.add("addOrUpdateSchema:" + docId);
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable removeSchema(String environmentId, String docId, Set<String> targetPdpIds) {
+            schemaOps.add("removeSchema:" + docId);
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable commit() {
+            return Completable.complete();
+        }
+
+        @Override
+        public Completable commitScope(String environmentId, String targetPdpId) {
+            return Completable.complete();
+        }
+    }
+}

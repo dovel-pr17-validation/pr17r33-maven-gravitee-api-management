@@ -1,0 +1,128 @@
+{
+    "extends": ["github>gravitee-io/renovate-config","config:js-app"],
+    "circleci": {
+      "fileMatch": [
+        "(^|/).circleci/src/config.ts$",
+        "(^|/).circleci/config.yml$"
+      ]
+    },
+    "customManagers": [
+        {
+            "customType": "regex",
+            "description": "Reads the gbuddy pin (hub: x.y.z) in .ai/manifest.yaml as a version of the @gravitee-io/gbuddy package.",
+            "managerFilePatterns": ["/(^|/)\\.ai/manifest\\.yaml$/"],
+            "matchStrings": ["(?:^|\\n)hub:\\s*[\"']?(?<currentValue>\\d+\\.\\d+\\.\\d+)[\"']?"],
+            "depNameTemplate": "@gravitee-io/gbuddy",
+            "datasourceTemplate": "npm",
+            "registryUrlTemplate": "https://npm.pkg.github.com"
+        }
+    ],
+    "gitIgnoredAuthors": ["gbuddy-update@users.noreply.github.com"],
+    "packageRules": [
+        {
+            // Group all angular related packages updates together
+            "packagePatterns": [
+                "^@angular/*",
+                "^@angular-builders/*",
+                "^@angular-devkit/*",
+                "^@angular-ru/*",
+                "^@angular-builders/*",
+                "^@angular-devkit/*",
+                "^@angular/cli$",
+                "^@angular/cdk$",
+                "^@angular/cdk-experimental$",
+                "^@angular/fire$",
+                "^@angular/flex-layout$",
+                "^@angular/material",
+                "ng-packagr"
+            ],
+            "groupName": "angular",
+            "enabled": false
+        },
+        {
+            // Group all eslint related packages updates together
+            "packagePatterns": ["^@typescript-eslint/*", "^eslint*", "^@angular-eslint/*"],
+            "groupName": "eslint"
+        },
+        {
+            // Group all Jest related packages updates together
+            "packagePatterns": ["@types/jest", "^jest*", "ts-jest", "jest-preset-angular"],
+            "groupName": "jest"
+        },
+        {
+            // Group all Storybook packages updates together
+            "packagePatterns": ["^@storybook/*"],
+            "groupName": "storybook"
+        },
+        {
+            "packageNames": ["typescript", "rxjs", "tslib"],
+            "separateMinorPatch": true
+        },
+        {
+            // Disable major upgrades for TypeScript, RxJS and tslib as they are linked to the Angular version
+            "packageNames": ["typescript", "rxjs", "tslib"],
+            "updateTypes": ["major"],
+            "enabled": false
+        },
+        {
+            // Disable minor upgrades for TypeScript it is linked to the Angular version
+            "packageNames": ["typescript"],
+            "updateTypes": ["minor"],
+            "enabled": false
+        },
+        {
+            // Legacy Angular console packages - move together on their own line
+            "matchPackageNames": ["@gravitee/ui-**"],
+            "groupName": "@gravitee/ui"
+        },
+        {
+            // Graphene design system - three packages, released in lockstep
+            "matchPackageNames": [
+                "@gravitee/graphene-core",
+                "@gravitee/graphene-charts",
+                "@gravitee/graphene-policy-studio"
+            ],
+            "groupName": "graphene"
+        },
+        {
+            // Separate release cycle from graphene; adoption is a deliberate decision
+            "matchPackageNames": ["@gravitee/gamma-lib-observability"],
+            "groupName": "gamma-lib-observability"
+        },
+        {
+            // Gravitee Maven artifacts are released by us and bumped here on purpose, so they
+            // must not queue behind the shared PR budget. Renovate resolves prConcurrentLimit
+            // and prHourlyLimit per branch from the matching packageRules, and 0 means "no
+            // limit" — branchConcurrentLimit inherits prConcurrentLimit, so it needs no entry.
+            "matchDatasources": ["maven"],
+            "matchPackageNames": ["com.graviteesource{/,}**", "io.gravitee{/,}**"],
+            "prConcurrentLimit": 0,
+            "prHourlyLimit": 0
+        },
+        {
+            // A prerelease stays on its own channel. Moving from alpha to beta, or out of a
+            // prerelease altogether, is a decision about the release line rather than a dependency
+            // update — it is taken once, by hand, when the line itself moves. matchCurrentVersion
+            // reads what the pom already holds, so this needs no per-module list and nothing to
+            // maintain when a module appears.
+            "matchDatasources": ["maven"],
+            "matchPackageNames": ["com.graviteesource{/,}**", "io.gravitee{/,}**"],
+            "matchCurrentVersion": "/-alpha\\./",
+            "allowedVersions": "/-alpha\\./"
+        },
+        {
+            "matchDatasources": ["maven"],
+            "matchPackageNames": ["com.graviteesource{/,}**", "io.gravitee{/,}**"],
+            "matchCurrentVersion": "/-beta\\./",
+            "allowedVersions": "/-beta\\./"
+        },
+        {
+            "description": "The gbuddy pin pull request opens at once, so the update workflow can report on it.",
+            "matchDepNames": ["@gravitee-io/gbuddy"],
+            "prCreation": "immediate",
+            "prBodyNotes": [
+                "This pull request raises the gbuddy pin. A workflow adds the regenerated AI context files and removes the ones this release no longer generates. Review the rule and skill text that changed. Questions: the Builder Experience team."
+            ]
+        }
+    ]
+}

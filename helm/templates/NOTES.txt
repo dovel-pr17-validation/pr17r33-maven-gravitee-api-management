@@ -1,0 +1,27 @@
+1. Watch all containers come up.
+  $ kubectl get pods --namespace={{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+{{- $hzActive := or (eq .Values.ratelimit.type "hazelcast") (eq (dig "cluster" "type" "" .Values.gateway) "hazelcast") }}
+{{- if and $hzActive (not .Values.apim.managedServiceAccount) }}
+
+WARNING: Hazelcast is enabled (ratelimit.type=hazelcast or gateway.cluster.type=hazelcast)
+but apim.managedServiceAccount is false, so the chart did NOT create the Role / RoleBinding
+that Hazelcast Kubernetes discovery needs. Each gateway pod will fall back to a single-member
+cluster (rate-limit budgets multiplied by replica count). Either set
+apim.managedServiceAccount=true, or grant the gateway ServiceAccount get/list permissions
+on endpoints/pods/nodes/services in namespace {{ .Release.Namespace }} out-of-band.
+{{- end }}
+{{- if include "gateway.distributedSync.enabled" . }}
+
+NOTE: Gateway distributed sync is enabled. Use one Helm release per sharding tag cluster with a
+unique Hazelcast cluster-name (default: "<release>-<sharding_tags>"). All releases may share Redis;
+distributed_event keys are scoped by clusterId. If sharding_tags or cluster-name change, delete
+stale distributed_event:* and distributed_sync_state:* keys for the old clusterId in Redis manually.
+{{- end }}
+{{- if or .Values.mongodb.enabled .Values.elasticsearch.enabled }}
+
+WARNING: The MongoDB and Elasticsearch subcharts (mongodb.enabled, elasticsearch.enabled) are deprecated
+and will be removed in APIM 4.15. They run Bitnami images that no longer receive security updates.
+Do not upgrade to 4.15 while one of them is enabled: first move your data to a MongoDB or Elasticsearch
+deployed outside this chart, point mongo.* or es.* at it, then disable the subchart.
+{{- end }}

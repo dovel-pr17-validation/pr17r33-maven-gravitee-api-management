@@ -1,0 +1,327 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.gravitee.common.event.EventManager;
+import io.gravitee.gateway.api.service.ApiKeyService;
+import io.gravitee.gateway.api.service.SubscriptionService;
+import io.gravitee.gateway.dictionary.DictionaryManager;
+import io.gravitee.gateway.env.GatewayConfiguration;
+import io.gravitee.gateway.handlers.accesspoint.manager.AccessPointManager;
+import io.gravitee.gateway.handlers.api.manager.ApiManager;
+import io.gravitee.gateway.handlers.api.manager.ApiProductManager;
+import io.gravitee.gateway.handlers.api.manager.CredentialManager;
+import io.gravitee.gateway.handlers.api.registry.ApiProductRegistry;
+import io.gravitee.gateway.handlers.cluster.manager.ClusterManager;
+import io.gravitee.gateway.handlers.sharedpolicygroup.manager.SharedPolicyGroupManager;
+import io.gravitee.gateway.platform.organization.manager.OrganizationManager;
+import io.gravitee.gateway.reactive.reactor.v4.subscription.SubscriptionDispatcher;
+import io.gravitee.gateway.services.sync.healthcheck.SyncProcessProbe;
+import io.gravitee.gateway.services.sync.process.common.deployer.ApiProductSubscriptionRefresher;
+import io.gravitee.gateway.services.sync.process.common.deployer.DeployerFactory;
+import io.gravitee.gateway.services.sync.process.common.mapper.SubscriptionMapper;
+import io.gravitee.gateway.services.sync.process.deployer.NoOpSubscriptionDispatcher;
+import io.gravitee.gateway.services.sync.process.distributed.service.DistributedSyncService;
+import io.gravitee.gateway.services.sync.process.distributed.service.NoopDistributedSyncService;
+import io.gravitee.gateway.services.sync.process.distributed.spring.DistributedSyncDisabledCondition;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiKeyMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiMapper;
+import io.gravitee.gateway.services.sync.process.repository.service.EnvironmentService;
+import io.gravitee.gateway.services.sync.process.repository.service.PlanService;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.ApiKeyAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.AuthzAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.NoopAuthzAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.PlanAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.SubscriptionAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzAppliedRevisions;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEnginePort;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzHostedScopes;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.EventBusAuthzEnginePort;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.GammaDisabledCondition;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.GammaEnabledCondition;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.NoopAuthzEnginePort;
+import io.gravitee.node.api.Node;
+import io.gravitee.node.api.license.LicenseFactory;
+import io.gravitee.node.api.license.LicenseManager;
+import io.gravitee.repository.management.api.ApiKeyRepository;
+import io.gravitee.repository.management.api.CommandRepository;
+import io.gravitee.repository.management.api.EnvironmentRepository;
+import io.gravitee.repository.management.api.OrganizationRepository;
+import io.gravitee.repository.management.api.PlanRepository;
+import io.gravitee.repository.management.api.SubscriptionRepository;
+import io.reactivex.rxjava3.annotations.NonNull;
+import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+
+/**
+ * @author David BRASSELY (david.brassely at graviteesource.com)
+ * @author Titouan COMPIEGNE (titouan.compiegne at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@Configuration
+public class SyncConfiguration {
+
+    public static final int POOL_SIZE = Runtime.getRuntime().availableProcessors() * 2;
+    public static final int DEFAULT_BULK_ITEMS = 100;
+    // Subscription cursor page size — appender warmup at 2.4M-subscription scale showed page count
+    // dominates round-trip overhead. 2000 keeps page count low; on JDBC larger pages help further
+    // (tune up to ~10000), on Mongo page size is near-neutral once the (plan,_id) index is present.
+    // Tune via services.sync.subscription.bulk_items. Note: this does NOT fall back to the legacy
+    // services.sync.bulk_items — that key only controls the events fetcher, so an old bulk_items=100
+    // can no longer silently down-tune subscription warmup to the pathological 100-row page path.
+    public static final int DEFAULT_SUBSCRIPTION_BULK_ITEMS = 2000;
+    // ApiKey cursor page size — appender warmup loads per-chunk via this page size. 1000 is a
+    // reasonable midpoint between JWT-heavy (low key volume) and apikey-heavy workloads.
+    // Tune via services.sync.apikey.bulk_items. Like the subscription page size, this no longer
+    // falls back to the legacy services.sync.bulk_items.
+    public static final int DEFAULT_APIKEY_BULK_ITEMS = 1000;
+    // Chunk size for the `subscriptions IN (...)` filter applied when loading ApiKeys (appender
+    // + refresher). Conservative default below common DB IN-list parameter limits; tune higher via
+    // services.sync.apikey.subscriptions_chunk_size only after validating the target DB's parameter ceiling.
+    public static final int DEFAULT_APIKEY_SUBSCRIPTIONS_CHUNK_SIZE = 900;
+    // Per-batch appender concurrency. The sync pipeline buffers APIs into batches of bulk_events
+    // and runs (plan+subscription+apikey) appenders per batch. 4 overlaps DB round trips across
+    // batches (≈3× faster warmup at scale than sequential) and is bounded by the sync executor
+    // pool; set to 1 for the previous sequential behavior. Tune via services.sync.appender.parallelism.
+    public static final int DEFAULT_APPENDER_PARALLELISM = 4;
+
+    @Bean("syncFetcherExecutor")
+    public ThreadPoolExecutor syncFetcherExecutor(@Value("${services.sync.fetcher:-1}") int syncFetcher) {
+        int poolSize = syncFetcher != -1 ? syncFetcher : POOL_SIZE;
+        final ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
+            1,
+            poolSize,
+            15L,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(),
+            newThreadFactory("gio.sync-fetcher-")
+        );
+
+        threadPoolExecutor.allowCoreThreadTimeOut(true);
+        threadPoolExecutor.prestartCoreThread();
+
+        return threadPoolExecutor;
+    }
+
+    @Bean("syncDeployerExecutor")
+    public ThreadPoolExecutor syncDeployerExecutor(@Value("${services.sync.deployer:-1}") int syncDeployer) {
+        int poolSize = syncDeployer != -1 ? syncDeployer : POOL_SIZE;
+        final ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
+            1,
+            poolSize,
+            15L,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(),
+            newThreadFactory("gio.sync-deployer-")
+        );
+
+        threadPoolExecutor.allowCoreThreadTimeOut(true);
+        threadPoolExecutor.prestartCoreThread();
+
+        return threadPoolExecutor;
+    }
+
+    public static ThreadFactory newThreadFactory(final String x) {
+        return new ThreadFactory() {
+            private int counter = 0;
+
+            @Override
+            public Thread newThread(@NonNull Runnable r) {
+                return new Thread(r, x + counter++);
+            }
+        };
+    }
+
+    @Bean
+    public ApiMapper apiMapper(ObjectMapper objectMapper, EnvironmentService environmentService) {
+        return new ApiMapper(objectMapper, environmentService);
+    }
+
+    @Bean
+    public SubscriptionMapper subscriptionMapper(ObjectMapper objectMapper, ApiProductRegistry apiProductRegistry) {
+        return new SubscriptionMapper(objectMapper, apiProductRegistry);
+    }
+
+    @Bean
+    public ApiKeyMapper apiKeyMapper() {
+        return new ApiKeyMapper();
+    }
+
+    @Bean
+    public PlanService planService() {
+        return new PlanService();
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzAppliedRevisions authzAppliedRevisions() {
+        return new AuthzAppliedRevisions();
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzEnginePort authzEnginePort(
+        io.vertx.rxjava3.core.Vertx vertx,
+        AuthzHostedScopes authzHostedScopes,
+        AuthzAppliedRevisions authzAppliedRevisions
+    ) {
+        return new EventBusAuthzEnginePort(vertx, authzHostedScopes, authzAppliedRevisions);
+    }
+
+    @Bean
+    @Conditional(GammaDisabledCondition.class)
+    public AuthzEnginePort noopAuthzEnginePort() {
+        return new NoopAuthzEnginePort();
+    }
+
+    @Bean
+    public EnvironmentService environmentEnhanceService(
+        EnvironmentRepository environmentRepository,
+        OrganizationRepository organizationRepository
+    ) {
+        return new EnvironmentService(environmentRepository, organizationRepository);
+    }
+
+    @Bean
+    public PlanAppender planAppender(
+        ObjectMapper objectMapper,
+        PlanRepository planRepository,
+        GatewayConfiguration gatewayConfiguration,
+        @Autowired(required = false) ApiProductRegistry apiProductRegistry
+    ) {
+        return new PlanAppender(objectMapper, planRepository, gatewayConfiguration, apiProductRegistry);
+    }
+
+    @Bean
+    public SubscriptionAppender subscriptionAppender(
+        SubscriptionRepository subscriptionRepository,
+        SubscriptionMapper subscriptionMapper,
+        @Value("${services.sync.subscription.bulk_items:" + DEFAULT_SUBSCRIPTION_BULK_ITEMS + "}") int bulkItems
+    ) {
+        return new SubscriptionAppender(subscriptionRepository, subscriptionMapper, bulkItems);
+    }
+
+    @Bean
+    public ApiKeyAppender apiKeyAppender(
+        ApiKeyRepository apiKeyRepository,
+        ApiKeyMapper apiKeyMapper,
+        @Value("${services.sync.apikey.bulk_items:" + DEFAULT_APIKEY_BULK_ITEMS + "}") int bulkItems,
+        @Value(
+            "${services.sync.apikey.subscriptions_chunk_size:" + DEFAULT_APIKEY_SUBSCRIPTIONS_CHUNK_SIZE + "}"
+        ) int subscriptionsChunkSize
+    ) {
+        return new ApiKeyAppender(apiKeyRepository, apiKeyMapper, bulkItems, subscriptionsChunkSize);
+    }
+
+    @Bean
+    @Conditional(DistributedSyncDisabledCondition.class)
+    public DistributedSyncService distributedSyncService() {
+        return new NoopDistributedSyncService();
+    }
+
+    @Bean
+    public DeployerFactory deployerFactory(
+        ApiKeyService apiKeyService,
+        SubscriptionService subscriptionService,
+        PlanService planCache,
+        @Lazy SubscriptionDispatcher subscriptionDispatcher,
+        CommandRepository commandRepository,
+        Node node,
+        GatewayConfiguration gatewayConfiguration,
+        ObjectMapper objectMapper,
+        ApiManager apiManager,
+        DictionaryManager dictionaryManager,
+        OrganizationManager organizationManager,
+        EventManager eventManager,
+        LicenseManager licenseManager,
+        LicenseFactory licenseFactory,
+        AccessPointManager accessPointManager,
+        SharedPolicyGroupManager sharedPolicyGroupManager,
+        ClusterManager clusterManager,
+        DistributedSyncService distributedSyncService,
+        ApiProductManager apiProductManager,
+        @Autowired(required = false) ApiProductSubscriptionRefresher apiProductSubscriptionRefresher,
+        AuthzEnginePort authzEnginePort,
+        CredentialManager credentialManager
+    ) {
+        Supplier<SubscriptionDispatcher> subscriptionDispatcherSupplier = provideSubscriptionDispatcher(subscriptionDispatcher);
+        return new DeployerFactory(
+            apiKeyService,
+            subscriptionService,
+            planCache,
+            subscriptionDispatcherSupplier,
+            commandRepository,
+            node,
+            gatewayConfiguration,
+            objectMapper,
+            apiManager,
+            dictionaryManager,
+            organizationManager,
+            eventManager,
+            licenseManager,
+            licenseFactory,
+            accessPointManager,
+            sharedPolicyGroupManager,
+            clusterManager,
+            distributedSyncService,
+            apiProductManager,
+            apiProductSubscriptionRefresher,
+            authzEnginePort,
+            credentialManager
+        );
+    }
+
+    @Bean
+    public AuthzAppender authzAppender() {
+        return new NoopAuthzAppender();
+    }
+
+    /**
+     * When no SubscriptionDispatcher available in the context, use a no-op one
+     * @param subscriptionDispatcher
+     * @return a supplier of SubscriptionDispatcher
+     */
+    protected Supplier<SubscriptionDispatcher> provideSubscriptionDispatcher(SubscriptionDispatcher subscriptionDispatcher) {
+        return () -> {
+            SubscriptionDispatcher dispatcher = subscriptionDispatcher;
+            try {
+                // try to use the subscriptionDispatcher bean to check if it is present in spring context
+                subscriptionDispatcher.lifecycleState();
+            } catch (NoSuchBeanDefinitionException e) {
+                // If absent, use a no-op subscription dispatcher
+                dispatcher = new NoOpSubscriptionDispatcher();
+            }
+            return dispatcher;
+        };
+    }
+
+    @Bean
+    public SyncProcessProbe syncProcessProbe(List<SyncManager> syncManagers) {
+        return new SyncProcessProbe(syncManagers);
+    }
+}

@@ -1,0 +1,4 @@
+{
+  "baseURL": "$MGMT_API_URL",
+  "defaultPortal": "$DEFAULT_PORTAL"
+}

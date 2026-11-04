@@ -1,0 +1,216 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.processor.error.template;
+
+import io.gravitee.common.http.HttpHeadersValues;
+import io.gravitee.common.http.MediaType;
+import io.gravitee.definition.model.ResponseTemplate;
+import io.gravitee.el.TemplateEngine;
+import io.gravitee.gateway.api.buffer.Buffer;
+import io.gravitee.gateway.api.http.HttpHeaderNames;
+import io.gravitee.gateway.reactive.api.ExecutionFailure;
+import io.gravitee.gateway.reactive.api.context.http.HttpPlainExecutionContext;
+import io.gravitee.gateway.reactive.handlers.api.processor.error.AbstractFailureProcessor;
+import io.gravitee.reporter.api.v4.metric.Diagnostic;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Single;
+import java.util.List;
+import java.util.Map;
+import lombok.CustomLog;
+
+/**
+ * @author David BRASSELY (david.brassely at graviteesource.com)
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+public class ResponseTemplateBasedFailureProcessor extends AbstractFailureProcessor {
+
+    public static final String ID = "response-template-failure-processor";
+    static final String WILDCARD_CONTENT_TYPE = "*/*";
+    static final String DEFAULT_RESPONSE_TEMPLATE = "DEFAULT";
+    // Well-known ExecutionFailure parameter pointing a fine-grained key at its umbrella/parent key. Producers (e.g. the
+    // http-proxy connection failure classifier) set the same literal; this processor cannot depend on those producers.
+    static final String PARENT_ERROR_KEY_PARAMETER = "parentErrorKey";
+
+    private ResponseTemplateBasedFailureProcessor() {
+        super();
+    }
+
+    public static ResponseTemplateBasedFailureProcessor instance() {
+        return Holder.INSTANCE;
+    }
+
+    @Override
+    public String getId() {
+        return ID;
+    }
+
+    @Override
+    protected Completable processFailure(final HttpPlainExecutionContext ctx, final ExecutionFailure executionFailure) {
+        if (executionFailure.key() != null) {
+            Map<String, Map<String, ResponseTemplate>> templates = getResponseTemplate(ctx);
+
+            Map<String, ResponseTemplate> responseTemplates = templates.get(executionFailure.key());
+
+            // No template for the fine-grained key: fall back to its umbrella/parent key so a template configured
+            // against the umbrella keeps firing for the more specific key.
+            if (responseTemplates == null) {
+                responseTemplates = parentErrorKeyTemplates(templates, executionFailure);
+            }
+
+            // No template associated to the error key, process the error message as usual
+            if (responseTemplates == null) {
+                // Try to fallback to default response template
+                Map<String, ResponseTemplate> defaultResponseTemplate = templates.get(DEFAULT_RESPONSE_TEMPLATE);
+                if (defaultResponseTemplate != null) {
+                    return handleAcceptHeader(ctx, defaultResponseTemplate, executionFailure);
+                } else {
+                    return super.processFailure(ctx, executionFailure);
+                }
+            } else {
+                return handleAcceptHeader(ctx, responseTemplates, executionFailure);
+            }
+        } else {
+            // No error key, process the error message as usual
+            return super.processFailure(ctx, executionFailure);
+        }
+    }
+
+    private static Map<String, ResponseTemplate> parentErrorKeyTemplates(
+        final Map<String, Map<String, ResponseTemplate>> templates,
+        final ExecutionFailure executionFailure
+    ) {
+        if (executionFailure.parameters() == null) {
+            return null;
+        }
+        Object parentKey = executionFailure.parameters().get(PARENT_ERROR_KEY_PARAMETER);
+        return parentKey instanceof String key ? templates.get(key) : null;
+    }
+
+    private Map<String, Map<String, ResponseTemplate>> getResponseTemplate(final HttpPlainExecutionContext ctx) {
+        try {
+            io.gravitee.definition.model.v4.Api api = ctx.getComponent(io.gravitee.definition.model.v4.Api.class);
+            return api.getResponseTemplates();
+        } catch (Exception e) {
+            // Version dispatch: a V2 API has no v4 Api component, so we fall back to the V2 model. Logged at debug so a
+            // genuine V4-path fault (not just the expected "no v4 component") is still traceable rather than silent.
+            ctx.withLogger(log).debug("No V4 API response templates resolved, falling back to V2 model", e);
+            io.gravitee.definition.model.Api api = ctx.getComponent(io.gravitee.definition.model.Api.class);
+            return api.getResponseTemplates();
+        }
+    }
+
+    private Completable handleAcceptHeader(
+        final HttpPlainExecutionContext context,
+        final Map<String, ResponseTemplate> templates,
+        final ExecutionFailure executionFailure
+    ) {
+        // Extract the content-type from the request
+        final List<MediaType> acceptMediaTypes = MediaType.parseMediaTypes(context.request().headers().getAll(HttpHeaderNames.ACCEPT));
+
+        // If no accept header, check if there is a template for type matching '*/*'
+        if (acceptMediaTypes == null || acceptMediaTypes.isEmpty()) {
+            return handleWildcardTemplate(context, templates, executionFailure);
+        } else {
+            // Check against the accepted media types from incoming request sort by the quality factor
+            MediaType.sortByQualityValue(acceptMediaTypes);
+
+            for (MediaType type : acceptMediaTypes) {
+                ResponseTemplate template = templates.get(type.toMediaString());
+
+                if (template != null) {
+                    return handleTemplate(context, template, executionFailure);
+                }
+            }
+
+            // No template matching the accepted media types, fallback to wildcard
+            return handleWildcardTemplate(context, templates, executionFailure);
+        }
+    }
+
+    private Completable handleWildcardTemplate(
+        final HttpPlainExecutionContext context,
+        final Map<String, ResponseTemplate> templates,
+        final ExecutionFailure executionFailure
+    ) {
+        ResponseTemplate template = templates.get(WILDCARD_CONTENT_TYPE);
+        if (template == null) {
+            // No template associated to the error key, process the error message as usual
+            return super.processFailure(context, executionFailure);
+        } else {
+            return handleTemplate(context, template, executionFailure);
+        }
+    }
+
+    private Completable handleTemplate(
+        final HttpPlainExecutionContext context,
+        final ResponseTemplate template,
+        final ExecutionFailure executionFailure
+    ) {
+        context.response().status(template.getStatusCode());
+        context.response().reason(HttpResponseStatus.valueOf(template.getStatusCode()).reasonPhrase());
+        context.response().headers().set(HttpHeaderNames.CONNECTION, HttpHeadersValues.CONNECTION_CLOSE);
+        if (template.isPropagateErrorKeyToLogs()) {
+            context.metrics().setErrorKey(executionFailure.key());
+            String message = executionFailure.message();
+            if (message != null && !message.isBlank()) {
+                context.metrics().setErrorMessage(message);
+            }
+        }
+
+        if (template.getBody() != null && !template.getBody().isEmpty()) {
+            context.response().headers().set(HttpHeaderNames.CONTENT_TYPE, context.request().headers().get(HttpHeaderNames.ACCEPT));
+        }
+
+        if (template.getHeaders() != null) {
+            template.getHeaders().forEach((name, value) -> context.response().headers().set(name, value));
+        }
+
+        if (template.getBody() != null && !template.getBody().isEmpty()) {
+            // Prepare templating context
+            final TemplateEngine templateEngine = context.getTemplateEngine();
+            // Expose the cleaned-up failure detail (the Diagnostic message indexed in analytics) as {#error.cause}, so a
+            // template can surface it even when ExecutionFailure has only a key + cause and no message (e.g. connection
+            // failures towards the backend). Kept out of the default failure body to avoid leaking detail by default.
+            final Diagnostic diagnostic = context.metrics().getFailure();
+            final String cause = diagnostic != null ? diagnostic.getMessage() : null;
+            templateEngine.getTemplateContext().setVariable("error", new EvaluableExecutionFailure(executionFailure, cause));
+
+            if (executionFailure.parameters() != null && !executionFailure.parameters().isEmpty()) {
+                templateEngine.getTemplateContext().setVariable("parameters", executionFailure.parameters());
+            }
+
+            // Apply templating
+            return templateEngine
+                .eval(template.getBody(), String.class)
+                .switchIfEmpty(Single.just(""))
+                .flatMapCompletable(body -> {
+                    Buffer payload = Buffer.buffer(body);
+                    context.response().headers().set(HttpHeaderNames.CONTENT_LENGTH, Integer.toString(payload.length()));
+                    context.response().body(payload);
+                    return Completable.complete();
+                });
+        }
+        return Completable.complete();
+    }
+
+    private static class Holder {
+
+        private static final ResponseTemplateBasedFailureProcessor INSTANCE = new ResponseTemplateBasedFailureProcessor();
+    }
+}

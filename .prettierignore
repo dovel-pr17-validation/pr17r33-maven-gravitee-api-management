@@ -1,0 +1,5 @@
+# Console
+gravitee-apim-console-webui/src/docs
+.circleci
+**/target
+.github/scripts/verify-ai-context.mjs

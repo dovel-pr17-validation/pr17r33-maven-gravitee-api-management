@@ -1,0 +1,193 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.repository.analytics.engine.api.query;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+/**
+ * @author GraviteeSource Team
+ */
+class ObservabilityEntrypointsTest {
+
+    @Nested
+    class Scopes {
+
+        /**
+         * Two constants sharing an id would repeat it in the derived lists and split its scope decision in
+         * two places, so a later reader could not tell which one the product meant.
+         */
+        @Test
+        void should_declare_each_entrypoint_id_once() {
+            var ids = Arrays.stream(ObservabilityEntrypoints.values()).map(ObservabilityEntrypoints::id).toList();
+
+            assertThat(ids).doesNotHaveDuplicates();
+        }
+
+        /**
+         * The analytics default is a complement: it names what is left out, so an entrypoint nobody has
+         * declared is counted rather than dropped. Asserted in declaration order, which is the order the
+         * ids reach Elasticsearch.
+         */
+        @Test
+        void should_exclude_from_analytics_everything_outside_the_http_scope() {
+            assertThat(ObservabilityEntrypoints.ANALYTICS_EXCLUDED_IDS).containsExactly(
+                "native-kafka",
+                "edge",
+                "authzen",
+                "sse",
+                "webhook",
+                "websocket",
+                "tcp-proxy"
+            );
+        }
+
+        /**
+         * Narrower than the analytics exclusion: the logs screen lists connections, so it serves the
+         * async entrypoints of Message APIs and native Kafka connections that the dashboards leave out.
+         */
+        @Test
+        void should_exclude_from_logs_only_the_dedicated_families_and_the_unsupported() {
+            assertThat(ObservabilityEntrypoints.LOGS_EXCLUDED_IDS).containsExactly("edge", "authzen", "tcp-proxy");
+        }
+
+        @Test
+        void should_recognise_a_declared_entrypoint_id() {
+            assertThat(ObservabilityEntrypoints.declares("mcp-studio")).isTrue();
+        }
+
+        /** What the startup warning keys off: an installed entrypoint nobody has decided on. */
+        @Test
+        void should_not_recognise_an_entrypoint_id_no_one_declared() {
+            assertThat(ObservabilityEntrypoints.declares("acme-custom")).isFalse();
+        }
+    }
+
+    @Nested
+    class AddedKinds {
+
+        /**
+         * An MCP tool server is a PROXY API and an agent a MESSAGE API: their type names neither kind, their
+         * entrypoint does. Every other entrypoint is served by APIs whose type already names the kind.
+         */
+        @Test
+        void should_add_an_api_to_a_kind_only_through_the_mcp_and_agent_entrypoints() {
+            var adding = Arrays.stream(ObservabilityEntrypoints.values())
+                .filter(entrypoint -> entrypoint.addedKind() != ObservabilityEntrypoints.AddedKind.NONE)
+                .collect(Collectors.toMap(ObservabilityEntrypoints::id, ObservabilityEntrypoints::addedKind));
+
+            assertThat(adding).containsOnly(
+                entry("mcp", ObservabilityEntrypoints.AddedKind.MCP),
+                entry("agent-to-agent", ObservabilityEntrypoints.AddedKind.A2A)
+            );
+        }
+
+        @Test
+        void should_list_the_entrypoints_adding_a_kind() {
+            assertThat(ObservabilityEntrypoints.idsAdding(ObservabilityEntrypoints.AddedKind.MCP)).containsExactly("mcp");
+            assertThat(ObservabilityEntrypoints.idsAdding(ObservabilityEntrypoints.AddedKind.A2A)).containsExactly("agent-to-agent");
+        }
+    }
+
+    /**
+     * Guards the registry against the drift it exists to prevent. Entrypoint plugins live in their
+     * own repositories, so nothing here can observe a new {@code entrypoint-id} directly; bundling
+     * the plugin in the distribution is the first moment a new entrypoint becomes visible to this
+     * repository, and that is where this test intervenes.
+     *
+     * <p>It matches artifact names, which is all this reactor can see. The id each plugin really
+     * declares is checked by {@code ObservabilityEntrypointsDistributionTest} in the distribution
+     * reactor, against the assembled plugins; this one stays as the fast check that runs whenever
+     * this module changes.
+     */
+    @Nested
+    class DistributionCoverage {
+
+        private static final Pattern ENTRYPOINT_PLUGIN_ARTIFACT = Pattern.compile(
+            "<artifactId>((?:gravitee-entrypoint|gravitee-apim-plugin-entrypoint)-[^<]+)</artifactId>"
+        );
+
+        /** The plugin SPI every entrypoint is built against, not an entrypoint itself. */
+        private static final String ENTRYPOINT_PLUGIN_SPI_ARTIFACT = "gravitee-apim-plugin-entrypoint-handler";
+
+        @Test
+        void should_declare_every_entrypoint_plugin_bundled_by_the_distribution() {
+            assertThat(bundledEntrypointPluginArtifacts())
+                .as("every bundled entrypoint plugin needs an ObservabilityEntrypoints entry stating its scope")
+                .isSubsetOf(declaredPluginArtifacts());
+        }
+
+        @Test
+        void should_not_declare_an_entrypoint_plugin_the_distribution_no_longer_bundles() {
+            assertThat(declaredPluginArtifacts())
+                .as("a declared entrypoint plugin that is no longer bundled leaves a stale scope decision behind")
+                .isSubsetOf(bundledEntrypointPluginArtifacts());
+        }
+
+        private Set<String> declaredPluginArtifacts() {
+            return Arrays.stream(ObservabilityEntrypoints.values())
+                .map(ObservabilityEntrypoints::pluginArtifactId)
+                .flatMap(Optional::stream)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        }
+
+        private Set<String> bundledEntrypointPluginArtifacts() {
+            var pom = standaloneDistributionPom();
+            String content;
+            try {
+                content = Files.readString(pom);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Unable to read " + pom, e);
+            }
+
+            var artifacts = new LinkedHashSet<String>();
+            var matcher = ENTRYPOINT_PLUGIN_ARTIFACT.matcher(content);
+            while (matcher.find()) {
+                var artifact = matcher.group(1);
+                if (!ENTRYPOINT_PLUGIN_SPI_ARTIFACT.equals(artifact)) {
+                    artifacts.add(artifact);
+                }
+            }
+
+            assertThat(artifacts).as("no entrypoint plugin found in %s — the parsing is stale", pom).isNotEmpty();
+            return artifacts;
+        }
+
+        private Path standaloneDistributionPom() {
+            var relativeToRoot = Path.of("gravitee-apim-distribution", "gravitee-apim-distribution-standalone", "pom.xml");
+            for (var candidate = Path.of("").toAbsolutePath(); candidate != null; candidate = candidate.getParent()) {
+                var pom = candidate.resolve(relativeToRoot);
+                if (Files.isRegularFile(pom)) {
+                    return pom;
+                }
+            }
+            throw new IllegalStateException("Unable to locate " + relativeToRoot + " from " + Path.of("").toAbsolutePath());
+        }
+    }
+}

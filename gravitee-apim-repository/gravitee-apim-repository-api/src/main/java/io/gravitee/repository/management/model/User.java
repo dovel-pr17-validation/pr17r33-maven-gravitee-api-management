@@ -1,0 +1,162 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.repository.management.model;
+
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+/**
+ * @author David BRASSELY (david.brassely at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Getter
+@Setter
+public class User {
+
+    public enum AuditEvent implements Audit.AuditEvent {
+        USER_CREATED,
+        USER_UPDATED,
+        USER_CONNECTED,
+        PASSWORD_RESET,
+        PASSWORD_CHANGED,
+        USER_CONFIRMED,
+        USER_REJECTED,
+    }
+
+    private String id;
+    private String organizationId;
+
+    /**
+     * The source when user is coming from an external system (LDAP, ...)
+     */
+    private String source;
+
+    /**
+     * The user reference in the external source
+     */
+    private String sourceId;
+
+    private String password;
+    private String email;
+    private String firstname;
+    private String lastname;
+    private Date createdAt;
+    private Date updatedAt;
+    private Date lastConnectionAt;
+    private Date firstConnectionAt;
+    private String picture;
+    private UserStatus status;
+    private long loginCount;
+    private Boolean newsletterSubscribed;
+    private Boolean isServiceAccount;
+
+    /**
+     * The product the user signed up on, or {@code null} when they did not sign themselves up and when they predate
+     * this being recorded. Read when an approved registration's activation email is built, long after the sign-up
+     * request that knew the answer has ended.
+     */
+    private RegistrationOrigin registrationOrigin;
+
+    /**
+     * IdP claims captured at login (whitelisted on the identity provider), for later use such as DCR injection.
+     *
+     * <p>{@code null} and an empty map are not interchangeable, and callers rely on the difference: {@code null} means
+     * no claims are stored and clears the value, while an empty map is itself a stored value. Every implementation of
+     * {@link io.gravitee.repository.management.api.UserRepository} must preserve that distinction, so a caller wanting
+     * to remove what was captured sets {@code null} rather than an empty map.
+     */
+    private Map<String, String> idpClaims;
+
+    public User(User cloned) {
+        this.id = cloned.id;
+        this.organizationId = cloned.organizationId;
+        this.source = cloned.source;
+        this.sourceId = cloned.sourceId;
+        this.password = cloned.password;
+        this.email = cloned.email;
+        this.firstname = cloned.firstname;
+        this.lastname = cloned.lastname;
+        this.createdAt = cloned.createdAt;
+        this.updatedAt = cloned.updatedAt;
+        this.lastConnectionAt = cloned.lastConnectionAt;
+        this.picture = cloned.picture;
+        this.status = cloned.status;
+        this.loginCount = cloned.loginCount;
+        this.firstConnectionAt = cloned.firstConnectionAt;
+        this.newsletterSubscribed = cloned.newsletterSubscribed;
+        this.isServiceAccount = cloned.isServiceAccount;
+        this.registrationOrigin = cloned.registrationOrigin;
+        this.idpClaims = cloned.idpClaims != null ? new HashMap<>(cloned.idpClaims) : null;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        User user = (User) o;
+        return Objects.equals(id, user.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
+    }
+
+    @Override
+    public String toString() {
+        return (
+            "User{" +
+            "id='" +
+            id +
+            '\'' +
+            ", organizationId='" +
+            organizationId +
+            '\'' +
+            ", source='" +
+            source +
+            '\'' +
+            ", sourceId='" +
+            sourceId +
+            '\'' +
+            ", firstname='" +
+            firstname +
+            '\'' +
+            ", lastname='" +
+            lastname +
+            '\'' +
+            ", mail='" +
+            email +
+            '\'' +
+            ", status='" +
+            status +
+            '\'' +
+            ", loginCount='" +
+            loginCount +
+            '\'' +
+            '}'
+        );
+    }
+}

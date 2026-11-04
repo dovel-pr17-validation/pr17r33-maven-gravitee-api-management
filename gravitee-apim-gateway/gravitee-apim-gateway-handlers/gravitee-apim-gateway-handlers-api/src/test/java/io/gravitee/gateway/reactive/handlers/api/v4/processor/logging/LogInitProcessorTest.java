@@ -1,0 +1,275 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.v4.processor.logging;
+
+import static io.gravitee.gateway.reactive.handlers.api.v4.processor.logging.LogInitProcessor.ID;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+import io.gravitee.gateway.reactive.api.ExecutionWarn;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.core.v4.analytics.AnalyticsContext;
+import io.gravitee.gateway.reactive.core.v4.analytics.LoggingContext;
+import io.gravitee.gateway.reactive.handlers.api.v4.processor.AbstractV4ProcessorTest;
+import io.gravitee.reporter.api.v4.log.Log;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.observers.TestObserver;
+import java.util.List;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@ExtendWith(MockitoExtension.class)
+class LogInitProcessorTest extends AbstractV4ProcessorTest {
+
+    protected static final String REQUEST_ID = "requestId";
+    protected static final String ORGANIZATION_ID = "orgId";
+    protected static final String ENVIRONMENT_ID = "envId";
+
+    /** Missing right-hand operand: the template engine rejects it at parse time with EL1042E, as a bare IllegalArgumentException. */
+    private static final String UNPARSEABLE_CONDITION = "{#request.headers[\"x\"][0] ==}";
+
+    private final LogInitProcessor cut = LogInitProcessor.instance();
+
+    @Mock
+    private AnalyticsContext analyticsContext;
+
+    @Mock
+    private LoggingContext loggingContext;
+
+    @BeforeEach
+    public void beforeEach() {
+        lenient().when(analyticsContext.isEnabled()).thenReturn(true);
+        lenient().when(analyticsContext.getLoggingContext()).thenReturn(loggingContext);
+        lenient().when(analyticsContext.isLoggingEnabled()).thenReturn(true);
+        lenient().when(loggingContext.computeReportTargets()).thenReturn(io.gravitee.reporter.api.ReportTarget.DEFAULT);
+        ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ANALYTICS_CONTEXT, analyticsContext);
+    }
+
+    @Test
+    void shouldNotLogWhenLoggingDisabled() {
+        when(analyticsContext.isLoggingEnabled()).thenReturn(false);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        verifyNoInteractions(mockMetrics);
+        verifyNoInteractions(mockRequest);
+    }
+
+    @Test
+    void shouldNotLogWhenLoggingConditionIsEvaluatedToFalse() {
+        when(loggingContext.getCondition()).thenReturn("false");
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+        verifyNoInteractions(mockMetrics);
+        verifyNoInteractions(mockRequest);
+    }
+
+    @Test
+    void should_skip_logging_and_let_the_request_continue_when_the_condition_cannot_be_parsed() {
+        when(loggingContext.getCondition()).thenReturn(UNPARSEABLE_CONDITION);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        verify(mockMetrics, never()).setLog(any(Log.class));
+    }
+
+    @Test
+    void should_report_a_warning_carrying_the_parse_failure_when_the_condition_cannot_be_parsed() {
+        when(loggingContext.getCondition()).thenReturn(UNPARSEABLE_CONDITION);
+
+        cut.execute(ctx).test().assertComplete();
+
+        final List<ExecutionWarn> warnings = ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_WARN);
+        assertNotNull(warnings);
+        assertEquals(1, warnings.size());
+        final ExecutionWarn warn = warnings.get(0);
+        assertEquals("EXPRESSION_EVALUATION_ERROR", warn.key());
+        assertTrue(warn.message().contains(UNPARSEABLE_CONDITION));
+        assertTrue(warn.cause().getMessage().contains("EL1042E"));
+    }
+
+    @Test
+    void should_propagate_a_failure_raised_while_building_the_log_entity() {
+        // Only the condition evaluation may degrade: a failure while building the log is a defect, not an unusable condition.
+        when(loggingContext.getCondition()).thenReturn("true");
+        doThrow(new IllegalStateException("log entity failure")).when(mockMetrics).setLog(any(Log.class));
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+
+        obs.assertError(IllegalStateException.class);
+        assertNull(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_WARN));
+    }
+
+    @Test
+    void shouldCreateLogWhenLoggingConditionIsEvaluatedToTrue() {
+        final long timestamp = System.currentTimeMillis();
+
+        when(loggingContext.getCondition()).thenReturn("true");
+        when(loggingContext.entrypointRequest()).thenReturn(false);
+        when(mockRequest.timestamp()).thenReturn(timestamp);
+        when(mockRequest.id()).thenReturn(REQUEST_ID);
+        when(mockMetrics.getOrganizationId()).thenReturn(ORGANIZATION_ID);
+        when(mockMetrics.getEnvironmentId()).thenReturn(ENVIRONMENT_ID);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+
+        final Log log = logCaptor.getValue();
+        assertNotNull(log);
+        assertEquals(timestamp, log.getTimestamp());
+        assertEquals(REQUEST_ID, log.getRequestId());
+        assertEquals(ORGANIZATION_ID, log.getOrganizationId());
+        assertEquals(ENVIRONMENT_ID, log.getEnvironmentId());
+        assertNull(log.getEntrypointRequest());
+    }
+
+    @Test
+    void shouldCreateLogWhenLoggingConditionIsNull() {
+        when(loggingContext.getCondition()).thenReturn(null);
+        when(loggingContext.entrypointRequest()).thenReturn(false);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        verify(mockMetrics).setLog(any(Log.class));
+    }
+
+    @Test
+    void shouldCreateLogWhenLoggingConditionIsEmpty() {
+        when(loggingContext.getCondition()).thenReturn("");
+        when(loggingContext.entrypointRequest()).thenReturn(false);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        verify(mockMetrics).setLog(any(Log.class));
+    }
+
+    @Test
+    void shouldInitEntrypointRequestWhenEntrypointRequestLogEnabled() {
+        when(loggingContext.entrypointRequest()).thenReturn(true);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+        assertNotNull(logCaptor.getValue().getEntrypointRequest());
+    }
+
+    @Test
+    void shouldInitEntrypointResponseWhenEntrypointResponseLogEnabled() {
+        when(loggingContext.entrypointResponse()).thenReturn(true);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+        assertNotNull(logCaptor.getValue().getEntrypointResponse());
+    }
+
+    @Test
+    void shouldInitEndpointRequestWhenEndpointRequestLogEnabled() {
+        when(loggingContext.endpointRequest()).thenReturn(true);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+        assertNotNull(logCaptor.getValue().getEndpointRequest());
+    }
+
+    @Test
+    void shouldInitEndpointResponseWhenEndpointResponseLogEnabled() {
+        when(loggingContext.endpointResponse()).thenReturn(true);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+        assertNotNull(logCaptor.getValue().getEndpointResponse());
+    }
+
+    @Test
+    void shouldCreateLogWhenOtelLogsEnabledWithoutEsLogging() {
+        // isLoggingEnabled() returns true because otelLogs is set — LogInitProcessor creates the Log
+        when(analyticsContext.isLoggingEnabled()).thenReturn(true);
+        when(loggingContext.getCondition()).thenReturn("");
+        // otelLogs widens direction methods → all 4 objects are initialised
+        when(loggingContext.entrypointRequest()).thenReturn(true);
+        when(loggingContext.entrypointResponse()).thenReturn(true);
+        when(loggingContext.endpointRequest()).thenReturn(true);
+        when(loggingContext.endpointResponse()).thenReturn(true);
+        when(mockRequest.timestamp()).thenReturn(System.currentTimeMillis());
+        when(mockRequest.id()).thenReturn(REQUEST_ID);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        ArgumentCaptor<Log> logCaptor = ArgumentCaptor.forClass(Log.class);
+        verify(mockMetrics).setLog(logCaptor.capture());
+
+        final Log log = logCaptor.getValue();
+        assertNotNull(log);
+        assertNotNull(log.getEntrypointRequest());
+        assertNotNull(log.getEntrypointResponse());
+        assertNotNull(log.getEndpointRequest());
+        assertNotNull(log.getEndpointResponse());
+    }
+
+    @Test
+    void shouldNotCreateLogWhenOtelLogsDisabledAndNoEsLogging() {
+        // isLoggingEnabled() returns false — no ES logging and otelLogs off
+        when(analyticsContext.isLoggingEnabled()).thenReturn(false);
+
+        final TestObserver<Void> obs = cut.execute(ctx).test();
+        obs.assertComplete();
+
+        verifyNoInteractions(mockMetrics);
+        verifyNoInteractions(mockRequest);
+    }
+
+    @Test
+    void shouldReturnId() {
+        assertEquals(ID, cut.getId());
+    }
+}

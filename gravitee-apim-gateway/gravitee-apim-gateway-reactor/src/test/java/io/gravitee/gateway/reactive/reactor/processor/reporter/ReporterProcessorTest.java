@@ -1,0 +1,465 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.reactor.processor.reporter;
+
+import static io.gravitee.gateway.reactive.core.v4.entrypoint.DefaultEntrypointConnectorResolver.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER;
+import static org.assertj.core.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+import io.gravitee.definition.model.DefinitionVersion;
+import io.gravitee.gateway.api.ExecutionContext;
+import io.gravitee.gateway.api.http.HttpHeaders;
+import io.gravitee.gateway.reactive.api.ComponentType;
+import io.gravitee.gateway.reactive.api.connector.Connector;
+import io.gravitee.gateway.reactive.api.connector.entrypoint.BaseEntrypointConnector;
+import io.gravitee.gateway.reactive.api.context.ContextAttributes;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.core.context.HttpExecutionContextInternal;
+import io.gravitee.gateway.reactive.core.v4.entrypoint.DefaultEntrypointConnectorResolver;
+import io.gravitee.gateway.reactive.reactor.processor.AbstractProcessorTest;
+import io.gravitee.gateway.reactor.ReactableApi;
+import io.gravitee.gateway.report.ReporterService;
+import io.gravitee.reporter.api.common.Response;
+import io.gravitee.reporter.api.v4.log.Log;
+import io.gravitee.reporter.api.v4.metric.AdditionalMetric;
+import io.gravitee.reporter.api.v4.metric.Metrics;
+import io.gravitee.reporter.api.v4.metric.NoopMetrics;
+import java.util.List;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+@ExtendWith(MockitoExtension.class)
+class ReporterProcessorTest extends AbstractProcessorTest {
+
+    @Mock
+    private ReactableApi reactableApi;
+
+    @Mock
+    private ReporterService reporterService;
+
+    @Mock
+    private Response response;
+
+    private ReporterProcessor reporterProcessor;
+
+    @BeforeEach
+    public void beforeEach() {
+        reporterProcessor = new ReporterProcessor(reporterService);
+    }
+
+    @Nested
+    class ApiV4 {
+
+        @Test
+        void should_report_metrics_when_api_v4_found_and_analytics_is_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            final Connector mockConnector = mock(Connector.class);
+            when(mockConnector.id()).thenReturn("fake-connector");
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR, mockConnector);
+            ctx.setAttribute(ContextAttributes.ATTR_QUOTA_COUNT, 4L);
+            ctx.setAttribute(ContextAttributes.ATTR_QUOTA_LIMIT, 10L);
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            verify(reporterService).report(ctx.metrics());
+            assertNull(ctx.metrics().getLog());
+            assertThat(ctx.metrics().getEntrypointId()).isEqualTo("fake-connector");
+
+            assertThat(ctx.metrics().getAdditionalMetrics()).contains(new AdditionalMetric.LongMetric("long_quota.limit", 10L));
+            assertThat(ctx.metrics().getAdditionalMetrics()).contains(new AdditionalMetric.LongMetric("long_quota.count", 4L));
+            verify(reporterService, never()).report(ctx.metrics().getLog());
+        }
+
+        @Test
+        void should_not_report_metrics_when_api_v4_found_and_analytics_is_disabled() {
+            // Given
+            ctx.metrics(new NoopMetrics());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNull(ctx.metrics().getLog());
+            verifyNoInteractions(reporterService);
+        }
+
+        @Test
+        void should_report_metrics_and_log_when_analytics_and_log_are_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setLog(Log.builder().build());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getLog());
+            verify(reporterService).report(ctx.metrics());
+            verify(reporterService).report(ctx.metrics().getLog());
+        }
+
+        @Test
+        void should_set_api_product_id_on_log_when_metrics_has_api_product_id() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setApiProductId("product-id");
+            ctx.metrics().setLog(Log.builder().build());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertThat(ctx.metrics().getLog().getApiProductId()).isEqualTo("product-id");
+        }
+
+        @Test
+        void should_set_subscription_and_error_context_on_log() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setApplicationId("app-id");
+            ctx.metrics().setApplicationName("my-app");
+            ctx.metrics().setPlanId("plan-id");
+            ctx.metrics().setSubscriptionId("sub-id");
+            ctx.metrics().setErrorKey("GATEWAY_CLIENT_CONNECTION_REFUSED");
+            ctx.metrics().setErrorMessage("Connection refused");
+            ctx.metrics().setLog(Log.builder().build());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            Log log = ctx.metrics().getLog();
+            assertThat(log.getApplicationId()).isEqualTo("app-id");
+            assertThat(log.getApplicationName()).isEqualTo("my-app");
+            assertThat(log.getPlanId()).isEqualTo("plan-id");
+            assertThat(log.getSubscriptionId()).isEqualTo("sub-id");
+            assertThat(log.getErrorKey()).isEqualTo("GATEWAY_CLIENT_CONNECTION_REFUSED");
+            assertThat(log.getErrorMessage()).isEqualTo("Connection refused");
+        }
+
+        @Test
+        void should_set_null_error_fields_on_log_when_no_error() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setApplicationId("app-id");
+            ctx.metrics().setLog(Log.builder().build());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            Log log = ctx.metrics().getLog();
+            assertThat(log.getApplicationId()).isEqualTo("app-id");
+            assertThat(log.getErrorKey()).isNull();
+            assertThat(log.getErrorMessage()).isNull();
+        }
+
+        @Test
+        void should_attribute_endpoint_component_when_translating_error_with_endpoint() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setErrorKey("GATEWAY_CLIENT_CONNECTION_RESET");
+            ctx.metrics().setErrorMessage("Connection reset by peer");
+            ctx.metrics().setEndpoint("https://backend.example.com/api");
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getFailure());
+            assertThat(ctx.metrics().getFailure().getKey()).isEqualTo("GATEWAY_CLIENT_CONNECTION_RESET");
+            assertThat(ctx.metrics().getFailure().getComponentType()).isEqualTo(ComponentType.ENDPOINT.name());
+            assertThat(ctx.metrics().getFailure().getComponentName()).isEqualTo("https://backend.example.com/api");
+        }
+
+        @Test
+        void should_keep_unknown_component_when_translating_client_abort_even_with_endpoint_set() {
+            // metrics.endpoint is set as soon as the connector attempts the backend call, so a client abort
+            // mid-response carries an endpoint too — it must NOT be attributed to the ENDPOINT component.
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setErrorKey("CLIENT_ABORTED_DURING_RESPONSE_ERROR");
+            ctx.metrics().setErrorMessage("The response cannot be sent to the client because the client has aborted");
+            ctx.metrics().setEndpoint("https://backend.example.com/api");
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getFailure());
+            assertThat(ctx.metrics().getFailure().getKey()).isEqualTo("CLIENT_ABORTED_DURING_RESPONSE_ERROR");
+            assertThat(ctx.metrics().getFailure().getComponentType()).isEqualTo("Unknown component");
+            assertThat(ctx.metrics().getFailure().getComponentName()).isEqualTo("Unknown component");
+        }
+
+        @Test
+        void should_keep_unknown_component_when_translating_error_without_endpoint() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setErrorKey("GATEWAY_POLICY_INTERNAL_ERROR");
+            ctx.metrics().setErrorMessage("boom");
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getFailure());
+            assertThat(ctx.metrics().getFailure().getComponentType()).isEqualTo("Unknown component");
+            assertThat(ctx.metrics().getFailure().getComponentName()).isEqualTo("Unknown component");
+        }
+
+        @Test
+        void should_execute_report_actions_when_analytics_and_log_are_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            Log log = Log.builder().entrypointResponse(response).build();
+            HttpHeaders headers = HttpHeaders.create();
+            when(response.getHeaders()).thenReturn(headers);
+            when(response.getOnReportActions()).thenReturn(List.of(response -> response.getHeaders().set("X-Gravitee-Test", "test")));
+            ctx.metrics().setLog(log);
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getLog());
+            assertEquals("test", ctx.metrics().getLog().getEntrypointResponse().getHeaders().get("X-Gravitee-Test"));
+        }
+    }
+
+    @Nested
+    class ApiV2 {
+
+        @Test
+        void should_report_metrics_when_api_v2_found_and_analytics_is_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V2);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.setAttribute(ExecutionContext.ATTR_QUOTA_COUNT, 4L);
+            ctx.setAttribute(ExecutionContext.ATTR_QUOTA_LIMIT, 10L);
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            verify(reporterService, never()).report(any(Metrics.class));
+            verify(reporterService).report(any(io.gravitee.reporter.api.http.Metrics.class));
+            assertNull(ctx.metrics().getLog());
+            verify(reporterService, never()).report(any(io.gravitee.reporter.api.log.Log.class));
+            verify(reporterService, never()).report(any(Log.class));
+            assertThat(ctx.metrics().getAdditionalMetrics()).contains(new AdditionalMetric.LongMetric("long_quota.limit", 10L));
+            assertThat(ctx.metrics().getAdditionalMetrics()).contains(new AdditionalMetric.LongMetric("long_quota.count", 4L));
+        }
+
+        @Test
+        void should_not_report_metrics_when_api_v2_found_and_analytics_is_disabled() {
+            // Given
+            ctx.metrics(new NoopMetrics());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNull(ctx.metrics().getLog());
+            verifyNoInteractions(reporterService);
+        }
+
+        @Test
+        void should_report_metrics_and_log_when_analytics_and_log_are_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V2);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            ctx.metrics().setLog(Log.builder().build());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            verify(reporterService, never()).report(any(Metrics.class));
+            verify(reporterService).report(any(io.gravitee.reporter.api.http.Metrics.class));
+            assertNotNull(ctx.metrics().getLog());
+            verify(reporterService).report(any(io.gravitee.reporter.api.log.Log.class));
+            verify(reporterService, never()).report(any(Log.class));
+        }
+
+        @Test
+        void should_execute_report_actions_when_analytics_and_log_are_enabled() {
+            // Given
+            when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V2);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+            Log log = Log.builder().entrypointResponse(response).build();
+            HttpHeaders headers = HttpHeaders.create();
+            when(response.getHeaders()).thenReturn(headers);
+            when(response.getOnReportActions()).thenReturn(List.of(response -> response.getHeaders().set("X-Gravitee-Test", "test")));
+            ctx.metrics().setLog(log);
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNotNull(ctx.metrics().getLog());
+            assertEquals("test", ctx.metrics().getLog().getEntrypointResponse().getHeaders().get("X-Gravitee-Test"));
+        }
+    }
+
+    @Nested
+    class NotFound {
+
+        @Test
+        void should_report_metrics_when_no_api_found_and_analytics_is_enabled() {
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            verify(reporterService).report(ctx.metrics());
+            assertNull(ctx.metrics().getLog());
+            verify(reporterService, never()).report(ctx.metrics().getLog());
+        }
+
+        @Test
+        void should_not_report_metrics_when_no_api_found_and_analytics_are_disabled() {
+            // Given
+            ctx.metrics(new NoopMetrics());
+
+            // When
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            // Then
+            assertNull(ctx.metrics().getLog());
+            verifyNoInteractions(reporterService);
+        }
+    }
+
+    /**
+     * Requests refused before an entrypoint connector was selected are attributed to the entrypoint they were
+     * addressed to, through the resolver the API reactor publishes; the connector attribute itself is never set
+     * here, since it means "this connector handled the request".
+     */
+    @Nested
+    class EntrypointAttribution {
+
+        @Mock
+        private DefaultEntrypointConnectorResolver resolver;
+
+        @Mock
+        private BaseEntrypointConnector<HttpExecutionContextInternal> addressedConnector;
+
+        @BeforeEach
+        void givenAV4Api() {
+            lenient().when(reactableApi.getDefinitionVersion()).thenReturn(DefinitionVersion.V4);
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_REACTABLE_API, reactableApi);
+        }
+
+        @Test
+        void should_keep_the_connector_that_handled_the_request_without_resolving_again() {
+            final Connector handlingConnector = mock(Connector.class);
+            when(handlingConnector.id()).thenReturn("http-proxy");
+            ctx.setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR, handlingConnector);
+            ctx.setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, resolver);
+
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            assertThat(ctx.metrics().getEntrypointId()).isEqualTo("http-proxy");
+            verifyNoInteractions(resolver);
+            verify(reporterService).report(ctx.metrics());
+        }
+
+        @Test
+        void should_attribute_a_request_refused_before_entrypoint_selection_to_the_entrypoint_it_was_addressed_to() {
+            when(addressedConnector.id()).thenReturn("mcp");
+            when(resolver.resolve(ctx)).thenReturn(addressedConnector);
+            ctx.setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, resolver);
+
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            assertThat(ctx.metrics().getEntrypointId()).isEqualTo("mcp");
+            assertThat((Object) ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR)).isNull();
+            verify(reporterService).report(ctx.metrics());
+        }
+
+        @Test
+        void should_leave_the_entrypoint_unset_when_no_entrypoint_matches_the_request() {
+            when(resolver.resolve(ctx)).thenReturn(null);
+            ctx.setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, resolver);
+
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            assertThat(ctx.metrics().getEntrypointId()).isNull();
+            verify(reporterService).report(ctx.metrics());
+        }
+
+        @Test
+        void should_still_report_when_resolving_the_entrypoint_fails() {
+            when(resolver.resolve(ctx)).thenThrow(new IllegalStateException("connector matching failed"));
+            ctx.setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, resolver);
+
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            assertThat(ctx.metrics().getEntrypointId()).isNull();
+            verify(reporterService).report(ctx.metrics());
+        }
+
+        @Test
+        void should_leave_the_entrypoint_unset_when_no_reactor_published_a_resolver() {
+            // Not-found and rejected-path chains never reach an API reactor: nothing to attribute to.
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            assertThat(ctx.metrics().getEntrypointId()).isNull();
+            verify(reporterService).report(ctx.metrics());
+        }
+
+        @Test
+        void should_not_resolve_anything_when_metrics_are_disabled() {
+            ctx.metrics(new NoopMetrics());
+            ctx.setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, resolver);
+
+            reporterProcessor.execute(ctx).test().assertResult();
+
+            verifyNoInteractions(resolver, reporterService);
+        }
+    }
+}

@@ -1,0 +1,649 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.spring;
+
+import static io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_BULK_ITEMS;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.gravitee.common.event.EventManager;
+import io.gravitee.gateway.api.service.ApiKeyService;
+import io.gravitee.gateway.api.service.SubscriptionService;
+import io.gravitee.gateway.env.GatewayConfiguration;
+import io.gravitee.gateway.handlers.api.manager.ApiManager;
+import io.gravitee.gateway.handlers.api.services.ApiKeyCacheService;
+import io.gravitee.gateway.handlers.api.services.SubscriptionCacheService;
+import io.gravitee.gateway.services.sync.process.common.deployer.ApiProductSubscriptionRefresher;
+import io.gravitee.gateway.services.sync.process.common.deployer.DeployerFactory;
+import io.gravitee.gateway.services.sync.process.common.mapper.SubscriptionMapper;
+import io.gravitee.gateway.services.sync.process.distributed.DistributedSynchronizer;
+import io.gravitee.gateway.services.sync.process.distributed.service.DistributedSyncService;
+import io.gravitee.gateway.services.sync.process.repository.DefaultSyncManager;
+import io.gravitee.gateway.services.sync.process.repository.RepositorySynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.AccessPointFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.ApiKeyFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.DebugEventFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.InstallationIdFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.LatestEventFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.LicenseFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.OrganizationIdsFetcher;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.SubscriptionFetcher;
+import io.gravitee.gateway.services.sync.process.repository.mapper.AccessPointMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiKeyMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiProductMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ClusterMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.DebugMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.DictionaryMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.OrganizationMapper;
+import io.gravitee.gateway.services.sync.process.repository.mapper.SharedPolicyGroupMapper;
+import io.gravitee.gateway.services.sync.process.repository.service.EnvironmentService;
+import io.gravitee.gateway.services.sync.process.repository.service.PlanService;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.accesspoint.AccessPointSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.ApiKeyAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.ApiSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.AuthzAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.PlanAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.RepositoryApiMemberResyncTrigger;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.api.SubscriptionAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.apikey.ApiKeySynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.apiproduct.ApiProductSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzAppliedRevisions;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEnginePort;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEntityMapper;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzEntitySynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzHostedScopes;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzPdpMapper;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzPdpSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzPolicyMapper;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzPolicySynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzSchemaMapper;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzSchemaSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.AuthzScopePlacement;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.authz.GammaEnabledCondition;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.cluster.ClusterSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.credential.CredentialMapper;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.credential.CredentialSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.debug.DebugSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.dictionary.DictionarySynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.license.LicenseSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.node.NodeMetadataSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.organization.FlowAppender;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.organization.OrganizationSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.sharedpolicygroup.SharedPolicyGroupSynchronizer;
+import io.gravitee.gateway.services.sync.process.repository.synchronizer.subscription.SubscriptionSynchronizer;
+import io.gravitee.node.api.Node;
+import io.gravitee.repository.management.api.AccessPointRepository;
+import io.gravitee.repository.management.api.ApiKeyRepository;
+import io.gravitee.repository.management.api.EnvironmentRepository;
+import io.gravitee.repository.management.api.EventLatestRepository;
+import io.gravitee.repository.management.api.EventRepository;
+import io.gravitee.repository.management.api.InstallationRepository;
+import io.gravitee.repository.management.api.LicenseRepository;
+import io.gravitee.repository.management.api.PlanRepository;
+import io.gravitee.repository.management.api.SubscriptionRepository;
+import io.vertx.ext.web.Router;
+import java.util.List;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+
+/**
+ * @author David BRASSELY (david.brassely at graviteesource.com)
+ * @author Titouan COMPIEGNE (titouan.compiegne at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@Configuration
+@Conditional(RepositorySyncCondition.class)
+public class RepositorySyncConfiguration {
+
+    @Bean
+    public DictionaryMapper dictionaryMapper(ObjectMapper objectMapper) {
+        return new DictionaryMapper(objectMapper);
+    }
+
+    @Bean
+    public OrganizationMapper organizationMapper(ObjectMapper objectMapper) {
+        return new OrganizationMapper(objectMapper);
+    }
+
+    @Bean
+    public DebugMapper debugMapper(EnvironmentService environmentService) {
+        return new DebugMapper(environmentService);
+    }
+
+    @Bean
+    public AccessPointMapper accessPointMapper() {
+        return new AccessPointMapper();
+    }
+
+    @Bean
+    public ClusterMapper clusterMapper(ObjectMapper objectMapper) {
+        return new ClusterMapper(objectMapper);
+    }
+
+    @Bean
+    public SharedPolicyGroupMapper sharedPolicyGroupMapper(ObjectMapper objectMapper, EnvironmentService environmentService) {
+        return new SharedPolicyGroupMapper(objectMapper, environmentService);
+    }
+
+    @Bean
+    public ApiProductMapper apiProductMapper(ObjectMapper objectMapper, EnvironmentService environmentService) {
+        return new ApiProductMapper(objectMapper, environmentService);
+    }
+
+    @Bean
+    public LatestEventFetcher eventFetcher(
+        EventLatestRepository eventLatestRepository,
+        @Value("${services.sync.bulk_items:" + DEFAULT_BULK_ITEMS + "}") int bulkItems
+    ) {
+        return new LatestEventFetcher(eventLatestRepository, bulkItems);
+    }
+
+    @Bean
+    public SubscriptionFetcher subscriptionFetcher(
+        SubscriptionRepository subscriptionRepository,
+        @Value(
+            "${services.sync.subscription.bulk_items:" +
+                io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_SUBSCRIPTION_BULK_ITEMS +
+                "}"
+        ) int bulkItems
+    ) {
+        return new SubscriptionFetcher(subscriptionRepository, bulkItems);
+    }
+
+    @Bean
+    public ApiKeyFetcher apiKeyFetcher(
+        ApiKeyRepository apiKeyRepository,
+        @Value(
+            "${services.sync.apikey.bulk_items:" + io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_APIKEY_BULK_ITEMS + "}"
+        ) int bulkItems
+    ) {
+        return new ApiKeyFetcher(apiKeyRepository, bulkItems);
+    }
+
+    @Bean
+    public DebugEventFetcher debugEventFetcher(EventRepository eventRepository, Node node) {
+        return new DebugEventFetcher(eventRepository, node);
+    }
+
+    @Bean
+    public LicenseFetcher licenseFetcher(
+        LicenseRepository licenseRepository,
+        @Value("${services.sync.bulk_items:" + DEFAULT_BULK_ITEMS + "}") int bulkItems
+    ) {
+        return new LicenseFetcher(licenseRepository, bulkItems);
+    }
+
+    @Bean
+    public AccessPointFetcher accessPointFetcher(
+        AccessPointRepository accessPointRepository,
+        @Value("${services.sync.bulk_items:" + DEFAULT_BULK_ITEMS + "}") int bulkItems
+    ) {
+        return new AccessPointFetcher(accessPointRepository, bulkItems);
+    }
+
+    @Bean
+    public OrganizationIdsFetcher organizationIdsFetcher(EnvironmentRepository environmentRepository, GatewayConfiguration configuration) {
+        return new OrganizationIdsFetcher(environmentRepository, configuration);
+    }
+
+    @Bean
+    public InstallationIdFetcher installationIdFetcher(InstallationRepository installationRepository) {
+        return new InstallationIdFetcher(installationRepository);
+    }
+
+    @Bean
+    public FlowAppender flowAppender(GatewayConfiguration gatewayConfiguration) {
+        return new FlowAppender(gatewayConfiguration);
+    }
+
+    @Bean
+    public ApiSynchronizer apiSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        ApiManager apiManager,
+        ApiMapper apiMapper,
+        PlanAppender planAppender,
+        SubscriptionAppender subscriptionAppender,
+        ApiKeyAppender apiKeyAppender,
+        AuthzAppender authzAppender,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor,
+        @Value(
+            "${services.sync.appender.parallelism:" + io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_APPENDER_PARALLELISM + "}"
+        ) int appenderParallelism
+    ) {
+        return new ApiSynchronizer(
+            eventsFetcher,
+            apiManager,
+            apiMapper,
+            planAppender,
+            subscriptionAppender,
+            apiKeyAppender,
+            authzAppender,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor,
+            appenderParallelism
+        );
+    }
+
+    @Bean(destroyMethod = "dispose")
+    public RepositoryApiMemberResyncTrigger apiMemberResyncTrigger(
+        @Lazy ApiSynchronizer apiSynchronizer,
+        ApiManager apiManager,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor,
+        EventManager eventManager,
+        @Lazy DefaultSyncManager syncManager
+    ) {
+        return new RepositoryApiMemberResyncTrigger(apiSynchronizer, apiManager, syncDeployerExecutor, eventManager, syncManager::syncDone);
+    }
+
+    @Bean
+    public SubscriptionSynchronizer subscriptionSynchronizer(
+        SubscriptionFetcher subscriptionFetcher,
+        SubscriptionMapper subscriptionMapper,
+        PlanService planCache,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new SubscriptionSynchronizer(
+            subscriptionFetcher,
+            subscriptionMapper,
+            deployerFactory,
+            planCache,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    public ApiKeySynchronizer apiKeySynchronizer(
+        final ApiKeyFetcher apiKeyFetcher,
+        final SubscriptionCacheService subscriptionService,
+        final ApiKeyMapper apiKeyMapper,
+        final DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new ApiKeySynchronizer(
+            apiKeyFetcher,
+            subscriptionService,
+            apiKeyMapper,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public CredentialMapper credentialMapper(ObjectMapper objectMapper) {
+        return new CredentialMapper(objectMapper);
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public CredentialSynchronizer credentialSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        CredentialMapper credentialMapper,
+        EnvironmentService environmentService,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new CredentialSynchronizer(
+            eventsFetcher,
+            credentialMapper,
+            environmentService,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    public DictionarySynchronizer dictionarySynchronizer(
+        LatestEventFetcher eventsFetcher,
+        DictionaryMapper dictionaryMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new DictionarySynchronizer(eventsFetcher, dictionaryMapper, deployerFactory, syncFetcherExecutor, syncDeployerExecutor);
+    }
+
+    @Bean
+    public OrganizationSynchronizer organizationSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        OrganizationMapper organizationMapper,
+        FlowAppender flowAppender,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new OrganizationSynchronizer(
+            eventsFetcher,
+            organizationMapper,
+            flowAppender,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    public DebugSynchronizer debugSynchronizer(
+        DebugEventFetcher debugEventFetcher,
+        DebugMapper debugMapperMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new DebugSynchronizer(debugEventFetcher, debugMapperMapper, deployerFactory, syncFetcherExecutor, syncDeployerExecutor);
+    }
+
+    @Bean
+    public LicenseSynchronizer licenseSynchronizer(
+        Node node,
+        LicenseFetcher licenseFetcher,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new LicenseSynchronizer(node, licenseFetcher, deployerFactory, syncFetcherExecutor, syncDeployerExecutor);
+    }
+
+    @Bean
+    public AccessPointSynchronizer accessPointSynchronizer(
+        AccessPointFetcher accessPointFetcher,
+        AccessPointMapper accessPointMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new AccessPointSynchronizer(
+            accessPointFetcher,
+            accessPointMapper,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    public ClusterSynchronizer clusterSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        ClusterMapper clusterMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new ClusterSynchronizer(eventsFetcher, clusterMapper, deployerFactory, syncFetcherExecutor, syncDeployerExecutor);
+    }
+
+    @Bean
+    public SharedPolicyGroupSynchronizer sharedPolicyGroupSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        SharedPolicyGroupMapper sharedPolicyGroupMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new SharedPolicyGroupSynchronizer(
+            eventsFetcher,
+            sharedPolicyGroupMapper,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzScopePlacement authzEntityScopePlacement() {
+        return new AuthzScopePlacement();
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzScopePlacement authzSchemaScopePlacement() {
+        return new AuthzScopePlacement();
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzScopePlacement authzPolicyScopePlacement() {
+        return new AuthzScopePlacement();
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzHostedScopes authzHostedScopes(GatewayConfiguration gatewayConfiguration) {
+        // A tag-scoped default ("default@<tag>") is served from the node's static sharding tags, so the
+        // registry needs them at construction.
+        return new AuthzHostedScopes(new java.util.HashSet<>(gatewayConfiguration.shardingTags().orElseGet(java.util.List::of)));
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzEntityMapper authzEntityMapper(ObjectMapper objectMapper) {
+        return new AuthzEntityMapper(objectMapper);
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzEntitySynchronizer authzEntitySynchronizer(
+        LatestEventFetcher eventsFetcher,
+        AuthzEntityMapper authzEntityMapper,
+        DeployerFactory deployerFactory,
+        AuthzEnginePort authzEnginePort,
+        @Qualifier("authzEntityScopePlacement") AuthzScopePlacement authzEntityScopePlacement,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new AuthzEntitySynchronizer(
+            eventsFetcher,
+            authzEntityMapper,
+            deployerFactory,
+            authzEnginePort,
+            authzEntityScopePlacement,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzPolicyMapper authzPolicyMapper(ObjectMapper objectMapper) {
+        return new AuthzPolicyMapper(objectMapper);
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzPolicySynchronizer authzPolicySynchronizer(
+        LatestEventFetcher eventsFetcher,
+        AuthzPolicyMapper authzPolicyMapper,
+        DeployerFactory deployerFactory,
+        AuthzEnginePort authzEnginePort,
+        @Qualifier("authzPolicyScopePlacement") AuthzScopePlacement authzPolicyScopePlacement,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new AuthzPolicySynchronizer(
+            eventsFetcher,
+            authzPolicyMapper,
+            deployerFactory,
+            authzEnginePort,
+            authzPolicyScopePlacement,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzSchemaMapper authzSchemaMapper(ObjectMapper objectMapper) {
+        return new AuthzSchemaMapper(objectMapper);
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzSchemaSynchronizer authzSchemaSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        AuthzSchemaMapper authzSchemaMapper,
+        DeployerFactory deployerFactory,
+        AuthzEnginePort authzEnginePort,
+        @Qualifier("authzSchemaScopePlacement") AuthzScopePlacement authzSchemaScopePlacement,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new AuthzSchemaSynchronizer(
+            eventsFetcher,
+            authzSchemaMapper,
+            deployerFactory,
+            authzEnginePort,
+            authzSchemaScopePlacement,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzPdpMapper authzPdpMapper(ObjectMapper objectMapper) {
+        return new AuthzPdpMapper(objectMapper);
+    }
+
+    @Bean
+    @Conditional(GammaEnabledCondition.class)
+    public AuthzPdpSynchronizer authzPdpSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        AuthzPdpMapper authzPdpMapper,
+        AuthzSchemaSynchronizer authzSchemaSynchronizer,
+        AuthzPolicySynchronizer authzPolicySynchronizer,
+        AuthzEntitySynchronizer authzEntitySynchronizer,
+        Node node,
+        GatewayConfiguration gatewayConfiguration,
+        io.vertx.rxjava3.core.Vertx vertx,
+        AuthzHostedScopes authzHostedScopes,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor,
+        AuthzAppliedRevisions authzAppliedRevisions
+    ) {
+        return new AuthzPdpSynchronizer(
+            eventsFetcher,
+            authzPdpMapper,
+            authzSchemaSynchronizer,
+            authzPolicySynchronizer,
+            authzEntitySynchronizer,
+            node,
+            gatewayConfiguration,
+            vertx,
+            authzHostedScopes,
+            syncFetcherExecutor,
+            syncDeployerExecutor,
+            authzAppliedRevisions
+        );
+    }
+
+    @Bean
+    public ApiProductSubscriptionRefresher apiProductSubscriptionRefresher(
+        SubscriptionRepository subscriptionRepository,
+        ApiKeyRepository apiKeyRepository,
+        SubscriptionMapper subscriptionMapper,
+        ApiKeyMapper apiKeyMapper,
+        SubscriptionCacheService subscriptionService,
+        ApiKeyCacheService apiKeyService,
+        @Value(
+            "${services.sync.apikey.bulk_items:" + io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_APIKEY_BULK_ITEMS + "}"
+        ) int bulkItems,
+        @Value(
+            "${services.sync.apikey.subscriptions_chunk_size:" +
+                io.gravitee.gateway.services.sync.SyncConfiguration.DEFAULT_APIKEY_SUBSCRIPTIONS_CHUNK_SIZE +
+                "}"
+        ) int subscriptionsChunkSize
+    ) {
+        return new ApiProductSubscriptionRefresher(
+            subscriptionRepository,
+            apiKeyRepository,
+            subscriptionMapper,
+            apiKeyMapper,
+            subscriptionService,
+            apiKeyService,
+            bulkItems,
+            subscriptionsChunkSize
+        );
+    }
+
+    @Bean
+    public ApiProductSynchronizer apiProductSynchronizer(
+        LatestEventFetcher eventsFetcher,
+        ApiProductMapper apiProductMapper,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new ApiProductSynchronizer(eventsFetcher, apiProductMapper, deployerFactory, syncFetcherExecutor, syncDeployerExecutor);
+    }
+
+    @Bean
+    public NodeMetadataSynchronizer nodeMetadataSynchronizer(
+        OrganizationIdsFetcher organizationIdsFetcher,
+        InstallationIdFetcher installationIdFetcher,
+        DeployerFactory deployerFactory,
+        @Qualifier("syncFetcherExecutor") ThreadPoolExecutor syncFetcherExecutor,
+        @Qualifier("syncDeployerExecutor") ThreadPoolExecutor syncDeployerExecutor
+    ) {
+        return new NodeMetadataSynchronizer(
+            organizationIdsFetcher,
+            installationIdFetcher,
+            deployerFactory,
+            syncFetcherExecutor,
+            syncDeployerExecutor
+        );
+    }
+
+    @Bean
+    public DefaultSyncManager syncManager(
+        @Qualifier("managementRouter") Router router,
+        final Node node,
+        final List<RepositorySynchronizer> synchronizers,
+        @Autowired(required = false) final List<DistributedSynchronizer> distributedSynchronizers,
+        final DistributedSyncService distributedSyncService,
+        @Value("${services.sync.delay:5000}") int delay,
+        @Value("${services.sync.unit:MILLISECONDS}") TimeUnit unit,
+        @Value("${services.sync.retry:3}") final int retryAttempt
+    ) {
+        return new DefaultSyncManager(
+            router,
+            node,
+            synchronizers,
+            distributedSynchronizers,
+            distributedSyncService,
+            delay,
+            unit,
+            retryAttempt
+        );
+    }
+}

@@ -1,0 +1,1430 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.v4;
+
+import static io.gravitee.common.component.Lifecycle.State.STOPPED;
+import static io.gravitee.common.http.HttpStatusCode.GATEWAY_TIMEOUT_504;
+import static io.gravitee.gateway.reactive.api.ExecutionPhase.RESPONSE;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_INVOKER;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_INVOKER_SKIP;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_VALIDATE_SUBSCRIPTION;
+import static io.gravitee.gateway.reactive.core.v4.entrypoint.DefaultEntrypointConnectorResolver.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER;
+import static io.gravitee.gateway.reactive.handlers.api.v4.DefaultApiReactor.PENDING_REQUESTS_TIMEOUT_PROPERTY;
+import static io.gravitee.gateway.reactive.handlers.api.v4.DefaultApiReactor.REQUEST_TIMEOUT_KEY;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import appender.MemoryAppender;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import io.gravitee.common.component.Lifecycle;
+import io.gravitee.common.event.EventListener;
+import io.gravitee.common.event.EventManager;
+import io.gravitee.common.http.HttpMethod;
+import io.gravitee.definition.model.v4.analytics.Analytics;
+import io.gravitee.definition.model.v4.listener.http.HttpListener;
+import io.gravitee.definition.model.v4.listener.http.Path;
+import io.gravitee.definition.model.v4.listener.subscription.SubscriptionListener;
+import io.gravitee.gateway.api.handler.Handler;
+import io.gravitee.gateway.api.proxy.ProxyConnection;
+import io.gravitee.gateway.api.stream.ReadWriteStream;
+import io.gravitee.gateway.core.component.CompositeComponentProvider;
+import io.gravitee.gateway.env.RequestTimeoutConfiguration;
+import io.gravitee.gateway.handlers.accesspoint.manager.AccessPointManager;
+import io.gravitee.gateway.handlers.api.event.ApiProductChangedEvent;
+import io.gravitee.gateway.handlers.api.event.ApiProductEventType;
+import io.gravitee.gateway.handlers.api.registry.ApiProductRegistry;
+import io.gravitee.gateway.opentelemetry.TracingContext;
+import io.gravitee.gateway.reactive.api.ApiType;
+import io.gravitee.gateway.reactive.api.ExecutionFailure;
+import io.gravitee.gateway.reactive.api.ExecutionPhase;
+import io.gravitee.gateway.reactive.api.apiservice.ApiService;
+import io.gravitee.gateway.reactive.api.apiservice.ApiServiceFactory;
+import io.gravitee.gateway.reactive.api.connector.entrypoint.BaseEntrypointConnector;
+import io.gravitee.gateway.reactive.api.context.ContextAttributes;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.api.context.http.HttpExecutionContext;
+import io.gravitee.gateway.reactive.api.policy.base.BasePolicy;
+import io.gravitee.gateway.reactive.core.context.DefaultDeploymentContext;
+import io.gravitee.gateway.reactive.core.context.DefaultExecutionContext;
+import io.gravitee.gateway.reactive.core.context.MutableExecutionContext;
+import io.gravitee.gateway.reactive.core.context.MutableRequest;
+import io.gravitee.gateway.reactive.core.context.MutableResponse;
+import io.gravitee.gateway.reactive.core.context.interruption.InterruptionException;
+import io.gravitee.gateway.reactive.core.context.interruption.InterruptionFailureException;
+import io.gravitee.gateway.reactive.core.processor.ProcessorChain;
+import io.gravitee.gateway.reactive.core.v4.endpoint.EndpointManager;
+import io.gravitee.gateway.reactive.core.v4.entrypoint.DefaultEntrypointConnectorResolver;
+import io.gravitee.gateway.reactive.core.v4.invoker.HttpEndpointInvoker;
+import io.gravitee.gateway.reactive.handlers.api.adapter.invoker.ConnectionHandlerAdapter;
+import io.gravitee.gateway.reactive.handlers.api.v4.flow.FlowChainFactory;
+import io.gravitee.gateway.reactive.handlers.api.v4.processor.ApiProcessorChainFactory;
+import io.gravitee.gateway.reactive.handlers.api.v4.security.HttpSecurityChain;
+import io.gravitee.gateway.reactive.policy.PolicyManager;
+import io.gravitee.gateway.reactor.accesspoint.ReactableAccessPoint;
+import io.gravitee.gateway.reactor.handler.Acceptor;
+import io.gravitee.gateway.reactor.handler.HttpAcceptor;
+import io.gravitee.gateway.reactor.handler.HttpAcceptorFactory;
+import io.gravitee.gateway.reactor.handler.http.AccessPointHttpAcceptor;
+import io.gravitee.gateway.report.ReporterService;
+import io.gravitee.gateway.report.guard.LogGuardService;
+import io.gravitee.gateway.resource.ResourceLifecycleManager;
+import io.gravitee.node.api.Node;
+import io.gravitee.node.api.configuration.Configuration;
+import io.gravitee.node.logging.LogEntry;
+import io.gravitee.plugin.apiservice.ApiServicePluginManager;
+import io.gravitee.plugin.entrypoint.EntrypointConnectorPluginManager;
+import io.gravitee.reporter.api.v4.metric.Metrics;
+import io.gravitee.resource.api.Resource;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.CompletableEmitter;
+import io.reactivex.rxjava3.core.CompletableObserver;
+import io.reactivex.rxjava3.observers.TestObserver;
+import io.reactivex.rxjava3.plugins.RxJavaPlugins;
+import io.reactivex.rxjava3.schedulers.TestScheduler;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+import java.util.stream.Stream;
+import org.assertj.core.groups.Tuple;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.platform.commons.function.Try;
+import org.junit.platform.commons.util.ReflectionUtils;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
+import org.slf4j.helpers.NOPLogger;
+import org.springframework.test.util.ReflectionTestUtils;
+
+@ExtendWith(MockitoExtension.class)
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+class DefaultApiReactorTest {
+
+    public static final String CONTEXT_PATH = "context-path";
+    public static final String API_ID = "api-id";
+    public static final String ORGANIZATION_ID = "organization-id";
+    public static final String ENVIRONMENT_ID = "environment-id";
+
+    @Spy
+    Completable spyRequestPlatformFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyResponsePlatformFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyRequestPlanFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyResponsePlanFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyRequestApiFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyResponseApiFlowChain = Completable.complete();
+
+    @Spy
+    Completable spyEntrypointRequest = Completable.complete();
+
+    @Spy
+    Completable spyEntrypointResponse = Completable.complete();
+
+    @Spy
+    Completable spyBeforeHandleProcessors = Completable.complete();
+
+    @Spy
+    Completable spyAfterHandleProcessors = Completable.complete();
+
+    @Spy
+    Completable spyBeforeSecurityChainProcessors = Completable.complete();
+
+    @Spy
+    Completable spyBeforeApiExecutionProcessors = Completable.complete();
+
+    @Spy
+    Completable spyAfterApiExecutionProcessors = Completable.complete();
+
+    @Spy
+    Completable spyOnErrorProcessors = Completable.complete();
+
+    @Spy
+    Completable spyInvokerChain = Completable.complete();
+
+    @Spy
+    Completable spyInterruptionFailureException = Completable.error(new InterruptionFailureException(mock(ExecutionFailure.class)));
+
+    @Spy
+    Completable spyInterruptionException = Completable.error(new InterruptionException());
+
+    @Spy
+    Completable spySecurityChain = Completable.complete();
+
+    @Spy
+    Completable spyResponseEnd = Completable.complete();
+
+    @Spy
+    ResourceLifecycleManager resourceLifecycleManager;
+
+    @Mock
+    Configuration configuration;
+
+    @Mock
+    Node node;
+
+    @Mock
+    private Api api;
+
+    @Mock
+    private io.gravitee.definition.model.v4.Api apiDefinition;
+
+    @Mock
+    private CompositeComponentProvider apiComponentProvider;
+
+    @Mock
+    private PolicyManager policyManager;
+
+    @Mock
+    private DefaultEntrypointConnectorResolver entrypointConnectorResolver;
+
+    @Mock
+    private EntrypointConnectorPluginManager entrypointConnectorPluginManager;
+
+    @Mock
+    private ApiServicePluginManager apiServicePluginManager;
+
+    @Mock
+    private ApiServiceFactory apiServiceFactory;
+
+    @Mock
+    private ApiService apiService;
+
+    @Mock
+    private EndpointManager endpointManager;
+
+    @Mock
+    private HttpEndpointInvoker defaultInvoker;
+
+    @Mock
+    private io.gravitee.gateway.reactive.handlers.api.flow.FlowChainFactory flowChainFactory;
+
+    @Mock
+    private FlowChainFactory v4FlowChainFactory;
+
+    @Mock
+    private ApiProcessorChainFactory apiProcessorChainFactory;
+
+    @Mock
+    private ProcessorChain beforeHandleProcessors;
+
+    @Mock
+    private ProcessorChain afterHandleProcessors;
+
+    @Mock
+    private ProcessorChain beforeSecurityChainProcessors;
+
+    @Mock
+    private ProcessorChain beforeApiExecutionProcessors;
+
+    @Mock
+    private ProcessorChain afterApiExecutionProcessors;
+
+    @Mock
+    private ProcessorChain onErrorProcessors;
+
+    @Mock
+    private MutableExecutionContext ctx;
+
+    @Mock
+    private MutableRequest request;
+
+    @Mock
+    private MutableResponse response;
+
+    @Mock
+    private BaseEntrypointConnector entrypointConnector;
+
+    @Mock
+    private io.gravitee.gateway.reactive.handlers.api.flow.FlowChain platformFlowChain;
+
+    @Mock
+    private io.gravitee.gateway.reactive.handlers.api.v4.flow.FlowChain apiPlanFlowChain;
+
+    @Mock
+    private io.gravitee.gateway.reactive.handlers.api.v4.flow.FlowChain apiFlowChain;
+
+    @Mock
+    private HttpSecurityChain securityChain;
+
+    @Mock
+    private RequestTimeoutConfiguration requestTimeoutConfiguration;
+
+    @Mock
+    private ReporterService reporterService;
+
+    @Mock
+    private AccessPointManager accessPointManager;
+
+    @Mock
+    private EventManager eventManager;
+
+    @Mock
+    private ApiProductRegistry apiProductRegistry;
+
+    @Mock
+    private ApiProductPlanPolicyManagerFactory apiProductPlanPolicyManagerFactory;
+
+    private TestScheduler testScheduler;
+
+    private DefaultApiReactor cut;
+    private TracingContext tracingContext = TracingContext.noop();
+
+    @Mock
+    private LogGuardService logGuardService;
+
+    @BeforeEach
+    public void init() throws Exception {
+        lenient().when(ctx.withLogger(any())).thenReturn(NOPLogger.NOP_LOGGER);
+        lenient().when(ctx.request()).thenReturn(request);
+        lenient().when(ctx.response()).thenReturn(response);
+        lenient().when(ctx.getInternalAttribute(ATTR_INTERNAL_INVOKER)).thenReturn(defaultInvoker);
+        lenient().when(ctx.getInternalAttribute(ATTR_INTERNAL_INVOKER_SKIP)).thenReturn(false);
+
+        lenient().when(request.contextPath()).thenReturn("/contextPath");
+        lenient().when(request.timestamp()).thenReturn(System.currentTimeMillis());
+        lenient().when(response.end(any())).thenReturn(Completable.complete());
+        lenient().when(ctx.metrics()).thenReturn(mock(Metrics.class));
+        lenient().when(ctx.response()).thenReturn(response);
+        lenient().when(ctx.componentProvider(any())).thenReturn(ctx);
+        lenient().when(ctx.templateVariableProviders(any())).thenReturn(ctx);
+        lenient().when(ctx.interruptWith(any())).thenReturn(spyInterruptionFailureException);
+        lenient().when(ctx.interrupt()).thenReturn(spyInterruptionException);
+
+        lenient().when(request.contextPath()).thenReturn(CONTEXT_PATH);
+        lenient().when(api.getDefinition()).thenReturn(apiDefinition);
+        lenient().when(api.getId()).thenReturn(API_ID);
+        lenient().when(api.getDeployedAt()).thenReturn(new Date());
+        lenient().when(api.getOrganizationId()).thenReturn(ORGANIZATION_ID);
+        lenient().when(api.getEnvironmentId()).thenReturn(ENVIRONMENT_ID);
+        lenient().when(apiDefinition.getType()).thenReturn(io.gravitee.definition.model.v4.ApiType.PROXY);
+        lenient().when(apiDefinition.getAnalytics()).thenReturn(new Analytics());
+        lenient().when(apiProcessorChainFactory.beforeHandle(api)).thenReturn(beforeHandleProcessors);
+        lenient().when(apiProcessorChainFactory.afterHandle(api)).thenReturn(afterHandleProcessors);
+        lenient().when(apiProcessorChainFactory.beforeSecurityChain(api)).thenReturn(beforeSecurityChainProcessors);
+        lenient().when(apiProcessorChainFactory.beforeApiExecution(api)).thenReturn(beforeApiExecutionProcessors);
+        lenient().when(apiProcessorChainFactory.afterApiExecution(api)).thenReturn(afterApiExecutionProcessors);
+        lenient().when(apiProcessorChainFactory.onError(api)).thenReturn(onErrorProcessors);
+
+        lenient().when(flowChainFactory.createOrganizationFlow(api, tracingContext)).thenReturn(platformFlowChain);
+        lenient().when(platformFlowChain.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyRequestPlatformFlowChain);
+        lenient().when(platformFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+        lenient().when(securityChain.execute(any())).thenReturn(spySecurityChain);
+        lenient().when(v4FlowChainFactory.createPlanFlow(api, tracingContext)).thenReturn(apiPlanFlowChain);
+        lenient().when(apiPlanFlowChain.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyRequestPlanFlowChain);
+        lenient().when(apiPlanFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlanFlowChain);
+        lenient().when(v4FlowChainFactory.createApiFlow(api, tracingContext)).thenReturn(apiFlowChain);
+        lenient().when(apiFlowChain.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyRequestApiFlowChain);
+        lenient().when(apiFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponseApiFlowChain);
+
+        lenient().when(beforeHandleProcessors.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyBeforeHandleProcessors);
+        lenient().when(afterHandleProcessors.execute(ctx, RESPONSE)).thenReturn(spyAfterHandleProcessors);
+        lenient().when(beforeSecurityChainProcessors.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyBeforeSecurityChainProcessors);
+        lenient().when(beforeApiExecutionProcessors.execute(ctx, ExecutionPhase.REQUEST)).thenReturn(spyBeforeApiExecutionProcessors);
+        lenient().when(afterApiExecutionProcessors.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyAfterApiExecutionProcessors);
+        lenient().when(onErrorProcessors.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyOnErrorProcessors);
+
+        lenient().when(beforeHandleProcessors.getId()).thenReturn("mockBeforeHandleProcessors");
+        lenient().when(afterHandleProcessors.getId()).thenReturn("mockBeforeHandleProcessors");
+        lenient().when(beforeApiExecutionProcessors.getId()).thenReturn("mockBeforeApiFlowsProcessors");
+        lenient().when(afterApiExecutionProcessors.getId()).thenReturn("mockAfterApiFlowsProcessors");
+        lenient().when(onErrorProcessors.getId()).thenReturn("mockOnErrorProcessors");
+
+        lenient().when(defaultInvoker.invoke(any(HttpExecutionContext.class))).thenReturn(spyInvokerChain);
+        lenient().when(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_INVOKER)).thenReturn(defaultInvoker);
+        lenient().when(entrypointConnector.handleRequest(ctx)).thenReturn(spyEntrypointRequest);
+        lenient().when(entrypointConnector.handleResponse(ctx)).thenReturn(spyEntrypointResponse);
+
+        lenient().when(response.end(any())).thenReturn(spyResponseEnd);
+        lenient().when(entrypointConnectorResolver.resolve(ctx)).thenReturn(entrypointConnector);
+        lenient()
+            .when(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ENTRYPOINT_CONNECTOR))
+            .thenReturn(entrypointConnector);
+        lenient().when(entrypointConnector.supportedApi()).thenReturn(ApiType.PROXY);
+
+        when(configuration.getProperty(PENDING_REQUESTS_TIMEOUT_PROPERTY, Long.class, 10_000L)).thenReturn(10_000L);
+        when(configuration.getProperty(ATTR_INTERNAL_VALIDATE_SUBSCRIPTION, Boolean.class, true)).thenReturn(true);
+
+        lenient().when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(0L);
+        lenient().when(requestTimeoutConfiguration.getRequestTimeoutGraceDelay()).thenReturn(10000L);
+
+        when(apiServicePluginManager.getAllFactories()).thenReturn(List.of(apiServiceFactory));
+        when(apiServiceFactory.createService(any())).thenReturn(apiService);
+        when(apiService.start()).thenReturn(Completable.complete());
+        lenient().when(apiService.stop()).thenReturn(Completable.complete());
+
+        cut = buildApiReactor();
+
+        // make sure that Services that inherit from Lifecycle have been started after the ApiReactor start call
+        verify(resourceLifecycleManager).start();
+        verify(policyManager).start();
+        verify(endpointManager).start();
+        verify(apiService).start();
+
+        testScheduler = new TestScheduler();
+        RxJavaPlugins.setComputationSchedulerHandler(s -> testScheduler);
+    }
+
+    private DefaultApiReactor buildApiReactor() {
+        DefaultApiReactor defaultApiReactor = null;
+        try {
+            defaultApiReactor = new DefaultApiReactor(
+                api,
+                new DefaultDeploymentContext(),
+                apiComponentProvider,
+                new ArrayList<>(),
+                policyManager,
+                entrypointConnectorPluginManager,
+                apiServicePluginManager,
+                endpointManager,
+                resourceLifecycleManager,
+                apiProcessorChainFactory,
+                flowChainFactory,
+                v4FlowChainFactory,
+                configuration,
+                node,
+                requestTimeoutConfiguration,
+                reporterService,
+                accessPointManager,
+                eventManager,
+                new HttpAcceptorFactory(false),
+                tracingContext,
+                logGuardService,
+                apiProductRegistry,
+                apiProductPlanPolicyManagerFactory
+            );
+            ReflectionTestUtils.setField(defaultApiReactor, "entrypointConnectorResolver", entrypointConnectorResolver);
+            ReflectionTestUtils.setField(defaultApiReactor, "defaultInvoker", defaultInvoker);
+            defaultApiReactor.doStart();
+            ReflectionTestUtils.setField(defaultApiReactor, "httpSecurityChain", securityChain);
+        } catch (Exception e) {
+            fail(e);
+        }
+        return defaultApiReactor;
+    }
+
+    @Test
+    void shouldPrepareContextAttributes() {
+        cut.handle(ctx).test().assertComplete();
+
+        verify(ctx).setAttribute(ContextAttributes.ATTR_CONTEXT_PATH, CONTEXT_PATH);
+        verify(ctx).setAttribute(ContextAttributes.ATTR_API, API_ID);
+        verify(ctx).setAttribute(ContextAttributes.ATTR_ORGANIZATION, ORGANIZATION_ID);
+        verify(ctx).setAttribute(ContextAttributes.ATTR_ENVIRONMENT, ENVIRONMENT_ID);
+    }
+
+    @Test
+    void shouldPublishEntrypointResolverWithContextAttributes() {
+        cut.handle(ctx).test().assertComplete();
+
+        InOrder inOrder = inOrder(ctx);
+        inOrder.verify(ctx).setAttribute(ContextAttributes.ATTR_CONTEXT_PATH, CONTEXT_PATH);
+        inOrder.verify(ctx).setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, entrypointConnectorResolver);
+    }
+
+    @Test
+    void shouldPublishEntrypointResolverWithoutResolvingWhenSecurityChainRefusesTheRequest() {
+        // The reporter attributes the refused request through the published resolver; the reactor itself still
+        // resolves the entrypoint only after the security chain, so 401 keeps precedence over 404.
+        when(securityChain.execute(ctx)).thenReturn(spyInterruptionFailureException);
+
+        cut.handle(ctx).test().assertComplete();
+
+        verify(ctx).setInternalAttribute(ATTR_INTERNAL_ENTRYPOINT_CONNECTOR_RESOLVER, entrypointConnectorResolver);
+        verify(entrypointConnectorResolver, never()).resolve(any());
+    }
+
+    private static LogEntry<?> requestMethodLogEntry;
+
+    @BeforeAll
+    @SuppressWarnings("unchecked")
+    static void extractRequestMethodLogEntry() {
+        Set<LogEntry<?>> logEntries = (Set<LogEntry<?>>) ReflectionTestUtils.getField(
+            DefaultApiReactor.class,
+            "DEFAULT_EXECUTION_CONTEXT_LOG_ENTRIES"
+        );
+        requestMethodLogEntry = logEntries
+            .stream()
+            .filter(entry -> "requestMethod".equals(entry.getKey()))
+            .findFirst()
+            .orElseThrow();
+    }
+
+    static Stream<Arguments> requestMethodAttributeShapes() {
+        return Stream.of(
+            arguments(HttpMethod.POST, "POST"),
+            arguments(io.vertx.core.http.HttpMethod.PUT, "PUT"),
+            arguments("GET", "GET"),
+            arguments(null, null)
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("requestMethodAttributeShapes")
+    void shouldRenderRequestMethodMdcEntryAsString(Object attributeValue, String expectedMdcValue) {
+        DefaultExecutionContext context = new DefaultExecutionContext(null, null);
+        context.setAttribute(ContextAttributes.ATTR_REQUEST_METHOD, attributeValue);
+        assertThat(requestMethodLogEntry.resolve(context)).isEqualTo(expectedMdcValue);
+    }
+
+    @Test
+    void shouldInterruptWith404FailureWhenNoEntrypoint() {
+        when(entrypointConnectorResolver.resolve(ctx)).thenReturn(null);
+
+        cut.handle(ctx).test().assertComplete();
+
+        final ArgumentCaptor<ExecutionFailure> failureArgumentCaptor = ArgumentCaptor.forClass(ExecutionFailure.class);
+        verify(ctx, atLeastOnce()).interruptWith(failureArgumentCaptor.capture());
+
+        // 404 isn't directly set on the response status as it is more a job for the error processor chain.
+        // The only way to assert here is to check the context has been interrupted with a failure.
+        final ExecutionFailure executionFailure = failureArgumentCaptor.getValue();
+        assertThat(executionFailure.statusCode()).isEqualTo(404);
+        assertThat(executionFailure.message()).isEqualTo("No entrypoint matches the incoming request");
+
+        verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldExecuteRequestAndResponsePhasesOnlyWhenUsingSyncEntrypoint() {
+        when(entrypointConnectorResolver.resolve(ctx)).thenReturn(entrypointConnector);
+        lenient().when(apiDefinition.getType()).thenReturn(io.gravitee.definition.model.v4.ApiType.PROXY);
+
+        cut = buildApiReactor();
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldSkipInvoker() {
+        when(entrypointConnectorResolver.resolve(ctx)).thenReturn(entrypointConnector);
+        lenient().when(apiDefinition.getType()).thenReturn(io.gravitee.definition.model.v4.ApiType.PROXY);
+
+        when(ctx.getInternalAttribute(ATTR_INTERNAL_INVOKER_SKIP)).thenReturn(true);
+
+        cut = buildApiReactor();
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+
+        // Invoker most not be invoked.
+        inOrder.verify(spyInvokerChain, never()).subscribe(any(CompletableObserver.class));
+
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldSkipApiResponseAndExecuteErrorChainWhenExceptionOccurs() {
+        spyInvokerChain = spy(Completable.error(new Exception("Mock exception")));
+        when(defaultInvoker.invoke(any(HttpExecutionContext.class))).thenReturn(spyInvokerChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+
+        // Response phases at api level must NOT be invoked if an unexpected error occurred during invocation.
+        inOrder.verify(spyResponsePlanFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors, never()).subscribe(any(CompletableObserver.class));
+
+        // But the rest of the response chains must be called (error chain, platform).
+        inOrder.verify(spyOnErrorProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    /**
+     * A policy that reserves something registers for the end of the request, because the response phase it would
+     * otherwise use is skipped when a request is interrupted — leaving a reservation charged for a call that
+     * reached no backend (AIAM-1054).
+     */
+    @Test
+    void shouldExecuteActionsOnTerminateWhenInvocationIsInterrupted() {
+        AtomicBoolean ran = new AtomicBoolean(false);
+        Function<HttpExecutionContext, Completable> action = c -> Completable.fromRunnable(() -> ran.set(true));
+        when(ctx.drainOnTerminateActions()).thenReturn(Map.of(mock(BasePolicy.class), action));
+        spyInvokerChain = spy(Completable.error(new InterruptionFailureException(new ExecutionFailure(400))));
+        when(defaultInvoker.invoke(any(HttpExecutionContext.class))).thenReturn(spyInvokerChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        assertThat(ran.get()).isTrue();
+    }
+
+    /**
+     * It has to run after the response, not before it. A response still being written has reported no usage yet,
+     * so a policy reconciling against that would settle for nothing and leave the real figure unclaimed — for a
+     * streamed response that would mean never charging it at all.
+     */
+    @Test
+    void shouldExecuteActionsOnTerminateOnlyOnceTheResponseHasBeenWritten() {
+        AtomicBoolean responseWritten = new AtomicBoolean(false);
+        AtomicBoolean ranBeforeResponse = new AtomicBoolean(false);
+        spyResponseEnd = spy(Completable.fromRunnable(() -> responseWritten.set(true)));
+        when(response.end(any())).thenReturn(spyResponseEnd);
+        Function<HttpExecutionContext, Completable> action = c ->
+            Completable.fromRunnable(() -> {
+                if (!responseWritten.get()) {
+                    ranBeforeResponse.set(true);
+                }
+            });
+        when(ctx.drainOnTerminateActions()).thenReturn(Map.of(mock(BasePolicy.class), action));
+
+        cut.handle(ctx).test().assertComplete();
+
+        assertThat(ranBeforeResponse.get()).isFalse();
+        assertThat(responseWritten.get()).isTrue();
+    }
+
+    /** A reconciliation going wrong must not become the answer the client is given. */
+    @Test
+    void shouldStillCompleteWhenAnActionOnTerminateFails() {
+        BasePolicy policy = mock(BasePolicy.class);
+        when(policy.id()).thenReturn("a-policy");
+        Function<HttpExecutionContext, Completable> failing = c -> Completable.error(new RuntimeException("cleanup failed"));
+        when(ctx.drainOnTerminateActions()).thenReturn(Map.of(policy, failing));
+
+        cut.handle(ctx).test().assertComplete();
+    }
+
+    @Test
+    void shouldSkipApiResponseAndExecuteErrorChainWhenInterruptionFailureExceptionOccurs() {
+        spyInvokerChain = spy(Completable.error(new InterruptionFailureException(new ExecutionFailure(500))));
+        when(defaultInvoker.invoke(any(HttpExecutionContext.class))).thenReturn(spyInvokerChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+
+        // Response phases at api level must NOT be invoked if an unexpected error occurred during invocation.
+        inOrder.verify(spyResponsePlanFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors, never()).subscribe(any(CompletableObserver.class));
+
+        // But the rest of the response chains must be called (error chain, platform).
+        inOrder.verify(spyOnErrorProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldSkipApiResponseAndExecutePostProcessorChainWhenNormalInterruptionOccurs() {
+        spyInvokerChain = spy(Completable.error(new InterruptionException()));
+        when(defaultInvoker.invoke(any(HttpExecutionContext.class))).thenReturn(spyInvokerChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+
+        // Response phases at api level must NOT be invoked if an unexpected error occurred during invocation.
+        inOrder.verify(spyResponsePlanFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyOnErrorProcessors, never()).subscribe(any(CompletableObserver.class));
+
+        // But the rest of the response chains must be called (post processor chain, platform).
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldHandleUnexpectedError() {
+        spyResponsePlatformFlowChain = spy(Completable.error(new Exception("Unexpected mock exception")));
+        when(platformFlowChain.execute(ctx, RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+
+        // In case of error we do not expect entrypoint.handleResponse to be called
+        inOrder.verify(spyEntrypointResponse, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        verify(response).status(HttpResponseStatus.INTERNAL_SERVER_ERROR.code());
+        verify(response).reason(HttpResponseStatus.INTERNAL_SERVER_ERROR.reasonPhrase());
+    }
+
+    @Test
+    void shouldHandleUnexpectedErrorDuringEntrypointResponseHandling() {
+        spyEntrypointResponse = spy(Completable.error(new Exception("Unexpected mock exception")));
+        when(entrypointConnector.handleResponse(ctx)).thenReturn(spyEntrypointResponse);
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        verify(response).status(HttpResponseStatus.INTERNAL_SERVER_ERROR.code());
+        verify(response).reason(HttpResponseStatus.INTERNAL_SERVER_ERROR.reasonPhrase());
+    }
+
+    @Test
+    void shouldTimeoutDuringApiFlow() {
+        when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(10000L, 0L);
+        spyInvokerChain = spy(Completable.complete().delay(20000, TimeUnit.MILLISECONDS));
+        when(defaultInvoker.invoke((HttpExecutionContext) ctx)).thenReturn(spyInvokerChain);
+
+        final TestObserver<Void> obs = cut.handle(ctx).subscribeOn(testScheduler).test();
+
+        obs.assertNotComplete();
+
+        testScheduler.advanceTimeBy(10000, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+        obs.assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+
+        // The next steps must not be executed because of timeout.
+        inOrder.verify(spyResponsePlanFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain, never()).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors, never()).subscribe(any(CompletableObserver.class));
+
+        inOrder.verify(spyOnErrorProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        final ArgumentCaptor<ExecutionFailure> failureArgumentCaptor = ArgumentCaptor.forClass(ExecutionFailure.class);
+        verify(ctx, atLeastOnce()).interruptWith(failureArgumentCaptor.capture());
+
+        // 504 isn't directly set on the response status as it is more a job for the error processor chain.
+        // The only way to assert here is to check the context has been interrupted with a failure.
+        final ExecutionFailure executionFailure = failureArgumentCaptor.getValue();
+        assertThat(executionFailure.statusCode()).isEqualTo(GATEWAY_TIMEOUT_504);
+        assertThat(executionFailure.key()).isEqualTo(REQUEST_TIMEOUT_KEY);
+
+        verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldTimeoutDuringPlatformResponseFlow() {
+        // Simulate a grace delay for platform flow (a bit tricky due to use of System.currentTimeMillis).
+        when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(0L, 1000L);
+        when(requestTimeoutConfiguration.getRequestTimeoutGraceDelay()).thenReturn(1000L);
+        spyInvokerChain = spy(Completable.complete().delay(9000, TimeUnit.MILLISECONDS));
+        spyResponsePlatformFlowChain = spy(Completable.complete().delay(3000, TimeUnit.MILLISECONDS));
+        when(defaultInvoker.invoke((HttpExecutionContext) ctx)).thenReturn(spyInvokerChain);
+        when(platformFlowChain.execute(ctx, RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+
+        final TestObserver<Void> obs = cut.handle(ctx).subscribeOn(testScheduler).test();
+        obs.assertNotComplete();
+
+        testScheduler.advanceTimeBy(9000, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        // Should not have completed after 9s because there is no request timeout.
+        obs.assertNotComplete();
+
+        // Should have complete after grace delay.
+        testScheduler.advanceTimeBy(1000, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+        obs.assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+
+        // Error flow must have been executed.
+        inOrder.verify(spyOnErrorProcessors).subscribe(any(CompletableObserver.class));
+
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        final ArgumentCaptor<ExecutionFailure> failureArgumentCaptor = ArgumentCaptor.forClass(ExecutionFailure.class);
+        verify(ctx, atLeastOnce()).interruptWith(failureArgumentCaptor.capture());
+
+        // 504 isn't directly set on the response status as it is more a job for the error processor chain.
+        // The only way to assert here is to check the context has been interrupted with a failure.
+        final ExecutionFailure executionFailure = failureArgumentCaptor.getValue();
+        assertThat(executionFailure.statusCode()).isEqualTo(GATEWAY_TIMEOUT_504);
+        assertThat(executionFailure.key()).isEqualTo(REQUEST_TIMEOUT_KEY);
+
+        verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldEndProperlyWhenTimeoutDuringEntrypointHandleResponse() {
+        // Note: due to clash with scheduler time vs System.currentTimeMillis when calculation remaining time for timeout,
+        // this trick to force set a timeout on entrypoint handle response.
+        when(requestTimeoutConfiguration.getRequestTimeout()).thenReturn(0L, 0L, 10000L);
+        when(requestTimeoutConfiguration.getRequestTimeoutGraceDelay()).thenReturn(10000L);
+        spyEntrypointResponse = spy(Completable.complete().delay(10000, TimeUnit.MILLISECONDS));
+
+        when(entrypointConnector.handleResponse(ctx)).thenReturn(spyEntrypointResponse);
+
+        final TestObserver<Void> obs = cut.handle(ctx).subscribeOn(testScheduler).test();
+        obs.assertNotComplete();
+
+        testScheduler.advanceTimeBy(9000, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        // Should not have completed after 9s because timeout is set to 10s.
+        obs.assertNotComplete();
+
+        testScheduler.advanceTimeBy(1001, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+        obs.assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyInvokerChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        inOrder.verify(spyOnErrorProcessors, never()).subscribe(any(CompletableObserver.class));
+
+        final ArgumentCaptor<ExecutionFailure> failureArgumentCaptor = ArgumentCaptor.forClass(ExecutionFailure.class);
+        verify(ctx, atLeastOnce()).interruptWith(failureArgumentCaptor.capture());
+
+        // 504 isn't directly set on the response status as it is more a job for the error processor chain.
+        // The only way to assert here is to check the context has been interrupted with a failure.
+        final ExecutionFailure executionFailure = failureArgumentCaptor.getAllValues().get(0);
+        assertThat(executionFailure.statusCode()).isEqualTo(GATEWAY_TIMEOUT_504);
+        assertThat(executionFailure.key()).isEqualTo(REQUEST_TIMEOUT_KEY);
+
+        verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void shouldHandleRequestWithLegacyInvoker() {
+        lenient().when(apiDefinition.getType()).thenReturn(io.gravitee.definition.model.v4.ApiType.PROXY);
+
+        io.gravitee.gateway.core.invoker.EndpointInvoker endpointInvoker = mock(io.gravitee.gateway.core.invoker.EndpointInvoker.class);
+        when(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_INVOKER)).thenReturn(endpointInvoker);
+
+        final ArgumentCaptor<Handler<ProxyConnection>> handlerArgumentCaptor = ArgumentCaptor.forClass(Handler.class);
+        doAnswer(invocation -> {
+            ConnectionHandlerAdapter connectionHandlerAdapter = invocation.getArgument(2);
+            final Try<Object> nextEmitter = ReflectionUtils.tryToReadFieldValue(
+                ConnectionHandlerAdapter.class,
+                "nextEmitter",
+                connectionHandlerAdapter
+            );
+            ((CompletableEmitter) nextEmitter.get()).onComplete();
+            return null;
+        })
+            .when(endpointInvoker)
+            .invoke(any(io.gravitee.gateway.api.ExecutionContext.class), any(ReadWriteStream.class), any(Handler.class));
+        cut.handle(ctx).test().assertComplete();
+
+        // Verify flow chain has been executed in the right order
+        InOrder inOrder = getInOrder();
+        inOrder.verify(spyBeforeHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeSecurityChainProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spySecurityChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyBeforeApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointRequest).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestPlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyRequestApiFlowChain).subscribe(any(CompletableObserver.class));
+
+        // Original invoker must NOT have been called because it has been replace with a v3 invoker.
+        inOrder.verify(spyInvokerChain, never()).subscribe(any(CompletableObserver.class));
+
+        inOrder.verify(spyResponsePlanFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseApiFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterApiExecutionProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponsePlatformFlowChain).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyEntrypointResponse).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+        inOrder.verify(spyResponseEnd).subscribe(any(CompletableObserver.class));
+
+        verify(endpointInvoker).invoke(any(), any(), handlerArgumentCaptor.capture());
+        assertThat(handlerArgumentCaptor.getValue()).isInstanceOf(ConnectionHandlerAdapter.class);
+    }
+
+    @Test
+    void shouldReturnHttpAcceptors() {
+        HttpListener httpListener = new HttpListener();
+        Path path = new Path("host", "path");
+        httpListener.setPaths(List.of(path));
+        httpListener.setEntrypoints(new ArrayList<>());
+        SubscriptionListener subscriptionListener = new SubscriptionListener();
+        subscriptionListener.setEntrypoints(new ArrayList<>());
+        when(apiDefinition.getListeners()).thenReturn(List.of(httpListener, subscriptionListener));
+
+        cut = buildApiReactor();
+        List<Acceptor<?>> acceptors = cut.acceptors();
+        assertThat(acceptors).hasSize(1);
+        Acceptor<?> acceptor1 = acceptors.get(0);
+        assertThat(acceptor1).isInstanceOf(HttpAcceptor.class);
+        HttpAcceptor httpAcceptor = (HttpAcceptor) acceptor1;
+        assertThat(httpAcceptor.path()).isEqualTo("path/");
+        assertThat(httpAcceptor.host()).isEqualTo(path.getHost());
+    }
+
+    @Test
+    void shouldReturnAccessPointHttpAcceptors() {
+        HttpListener httpListener = new HttpListener();
+        Path path = new Path(null, "path");
+        httpListener.setPaths(List.of(path));
+        httpListener.setEntrypoints(new ArrayList<>());
+        SubscriptionListener subscriptionListener = new SubscriptionListener();
+        subscriptionListener.setEntrypoints(new ArrayList<>());
+        when(apiDefinition.getListeners()).thenReturn(List.of(httpListener, subscriptionListener));
+        when(accessPointManager.getByEnvironmentId(ENVIRONMENT_ID)).thenReturn(
+            List.of(
+                ReactableAccessPoint.builder()
+                    .environmentId(ENVIRONMENT_ID)
+                    .host("host1")
+                    .target(ReactableAccessPoint.Target.GATEWAY)
+                    .build(),
+                ReactableAccessPoint.builder()
+                    .environmentId(ENVIRONMENT_ID)
+                    .host("host2")
+                    .target(ReactableAccessPoint.Target.GATEWAY)
+                    .build()
+            )
+        );
+
+        cut = buildApiReactor();
+        List<Acceptor<?>> acceptors = cut.acceptors();
+        assertThat(acceptors).hasSize(1);
+        Acceptor<?> acceptor1 = acceptors.get(0);
+        assertThat(acceptor1).isInstanceOf(AccessPointHttpAcceptor.class);
+        AccessPointHttpAcceptor accessPointHttpAcceptor = (AccessPointHttpAcceptor) acceptor1;
+        assertThat(accessPointHttpAcceptor.path()).isEqualTo("path/");
+        assertThat(accessPointHttpAcceptor.host()).isEqualTo("host1");
+        assertThat(accessPointHttpAcceptor.innerHttpsAcceptors())
+            .extracting(HttpAcceptor::host, HttpAcceptor::path)
+            .containsOnly(Tuple.tuple("host1", "path/"), Tuple.tuple("host2", "path/"));
+    }
+
+    @Test
+    void shouldSubscribeAndUnsubscribeWithSameLambdaListener() throws Exception {
+        ArgumentCaptor<EventListener<ApiProductEventType, ApiProductChangedEvent>> captor = ArgumentCaptor.forClass(EventListener.class);
+        verify(eventManager).subscribeForEvents(captor.capture(), eq(ApiProductEventType.class));
+        EventListener<ApiProductEventType, ApiProductChangedEvent> subscribedListener = captor.getValue();
+
+        assertThat(subscribedListener).isNotSameAs(cut);
+
+        cut.doStop();
+
+        verify(eventManager).unsubscribeForEvents(subscribedListener, ApiProductEventType.class);
+    }
+
+    @Test
+    void shouldNotLoseNewListenerWhenOldReactorStops() throws Exception {
+        ArgumentCaptor<EventListener<ApiProductEventType, ApiProductChangedEvent>> captor1 = ArgumentCaptor.forClass(EventListener.class);
+        verify(eventManager).subscribeForEvents(captor1.capture(), eq(ApiProductEventType.class));
+        EventListener<ApiProductEventType, ApiProductChangedEvent> oldListener = captor1.getValue();
+
+        buildApiReactor();
+        ArgumentCaptor<EventListener<ApiProductEventType, ApiProductChangedEvent>> captor2 = ArgumentCaptor.forClass(EventListener.class);
+        verify(eventManager, times(2)).subscribeForEvents(captor2.capture(), eq(ApiProductEventType.class));
+        EventListener<ApiProductEventType, ApiProductChangedEvent> newListener = captor2.getAllValues().get(1);
+
+        assertThat(newListener).isNotSameAs(oldListener);
+
+        cut.doStop();
+        verify(eventManager).unsubscribeForEvents(oldListener, ApiProductEventType.class);
+        verify(eventManager, never()).unsubscribeForEvents(newListener, ApiProductEventType.class);
+    }
+
+    @Test
+    void shouldWaitForPendingRequestBeforeStopping() throws Exception {
+        RxJavaPlugins.setIoSchedulerHandler(scheduler -> testScheduler);
+        when(node.lifecycleState()).thenReturn(Lifecycle.State.STARTED);
+        final AtomicLong pendingRequests = new AtomicLong(1);
+        ReflectionTestUtils.setField(cut, "pendingRequests", pendingRequests);
+
+        cut.doStop();
+
+        // Pre-stop should have been called
+        verify(entrypointConnectorResolver).preStop();
+        verify(endpointManager).preStop();
+
+        testScheduler.advanceTimeBy(2500L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        // Not called yet as there is still a pending request and timeout has not expired.
+        verify(entrypointConnectorResolver, times(0)).stop();
+        verify(endpointManager, times(0)).stop();
+        verify(resourceLifecycleManager, times(0)).stop();
+        verify(policyManager, times(0)).stop();
+
+        // Ends the pending request.
+        pendingRequests.decrementAndGet();
+        testScheduler.advanceTimeBy(100L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        verify(entrypointConnectorResolver).stop();
+        verify(endpointManager).stop();
+        verify(resourceLifecycleManager).stop();
+        verify(policyManager).stop();
+        verify(apiService).stop();
+        RxJavaPlugins.reset();
+    }
+
+    @Test
+    void should_warn_about_the_requests_it_cuts_short_when_it_stops() throws Exception {
+        final MemoryAppender memoryAppender = new MemoryAppender();
+        final Logger logger = (Logger) LoggerFactory.getLogger(AbstractApiReactor.class);
+        memoryAppender.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
+        logger.setLevel(Level.WARN);
+        logger.addAppender(memoryAppender);
+        memoryAppender.start();
+
+        RxJavaPlugins.setIoSchedulerHandler(scheduler -> testScheduler);
+        when(node.lifecycleState()).thenReturn(Lifecycle.State.STARTED);
+        ReflectionTestUtils.setField(cut, "pendingRequests", new AtomicLong(3));
+
+        cut.doStop();
+        testScheduler.advanceTimeBy(10_000L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        // Stopping closes the endpoints and policies from under those 3 requests: they end as errors, and without
+        // this line nothing in the logs ties the resulting spike to the redeploy that caused it.
+        assertThat(memoryAppender.getLoggedEvents()).hasSize(1);
+        assertThat(memoryAppender.getLoggedEvents().get(0).getFormattedMessage())
+            .contains("3 request(s) are still being handled")
+            .contains("api.pending_requests_timeout");
+
+        logger.detachAppender(memoryAppender);
+        RxJavaPlugins.reset();
+    }
+
+    @Test
+    void should_still_report_the_cut_requests_when_the_counter_empties_during_teardown() throws Exception {
+        final MemoryAppender memoryAppender = new MemoryAppender();
+        final Logger logger = (Logger) LoggerFactory.getLogger(AbstractApiReactor.class);
+        memoryAppender.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
+        logger.setLevel(Level.WARN);
+        logger.addAppender(memoryAppender);
+        memoryAppender.start();
+
+        RxJavaPlugins.setIoSchedulerHandler(scheduler -> testScheduler);
+        when(node.lifecycleState()).thenReturn(Lifecycle.State.STARTED);
+        final AtomicLong pendingRequests = new AtomicLong(2);
+        ReflectionTestUtils.setField(cut, "pendingRequests", pendingRequests);
+        // The counter empties while the teardown runs. Pins the invariant the reporting depends on: what is reported
+        // is what the wait loop observed, not what the counter happens to hold once the teardown is under way. On a
+        // live gateway the counter was already back to zero by then, and nothing was reported at all even though
+        // requests were demonstrably being cut short.
+        doAnswer(invocation -> {
+            pendingRequests.set(0);
+            return null;
+        })
+            .when(endpointManager)
+            .stop();
+
+        cut.doStop();
+        testScheduler.advanceTimeBy(10_000L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        verify(endpointManager).stop();
+        assertThat(memoryAppender.getLoggedEvents()).hasSize(1);
+        assertThat(memoryAppender.getLoggedEvents().get(0).getFormattedMessage()).contains("2 request(s) are still being handled");
+
+        logger.detachAppender(memoryAppender);
+        RxJavaPlugins.reset();
+    }
+
+    @Test
+    void should_not_warn_when_it_stops_with_no_request_left() throws Exception {
+        final MemoryAppender memoryAppender = new MemoryAppender();
+        final Logger logger = (Logger) LoggerFactory.getLogger(AbstractApiReactor.class);
+        memoryAppender.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
+        logger.setLevel(Level.WARN);
+        logger.addAppender(memoryAppender);
+        memoryAppender.start();
+
+        RxJavaPlugins.setIoSchedulerHandler(scheduler -> testScheduler);
+        when(node.lifecycleState()).thenReturn(Lifecycle.State.STARTED);
+
+        cut.doStop();
+        testScheduler.advanceTimeBy(10_000L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        // A clean shutdown is the common case: warning there would train operators to ignore the line.
+        assertThat(memoryAppender.getLoggedEvents()).isEmpty();
+
+        logger.detachAppender(memoryAppender);
+        RxJavaPlugins.reset();
+    }
+
+    @Test
+    void shouldWaitForPendingRequestAndForceStopAfter10sWhenRequestDoesNotFinish() throws Exception {
+        RxJavaPlugins.setIoSchedulerHandler(scheduler -> testScheduler);
+        when(node.lifecycleState()).thenReturn(Lifecycle.State.STARTED);
+        final AtomicLong pendingRequests = new AtomicLong(1);
+        ReflectionTestUtils.setField(cut, "pendingRequests", pendingRequests);
+        cut.doStop();
+
+        // Pre-stop should have been called
+        verify(entrypointConnectorResolver).preStop();
+        verify(endpointManager).preStop();
+
+        for (int i = 0; i < 99; i++) {
+            testScheduler.advanceTimeBy(100L, TimeUnit.MILLISECONDS);
+            testScheduler.triggerActions();
+
+            // Not called yet as there is still a pending request and timeout has not expired.
+            verify(entrypointConnectorResolver, times(0)).stop();
+            verify(endpointManager, times(0)).stop();
+            verify(resourceLifecycleManager, times(0)).stop();
+            verify(policyManager, times(0)).stop();
+        }
+
+        testScheduler.advanceTimeBy(100L, TimeUnit.MILLISECONDS);
+        testScheduler.triggerActions();
+
+        verify(entrypointConnectorResolver).stop();
+        verify(endpointManager).stop();
+        verify(resourceLifecycleManager).stop();
+        verify(policyManager).stop();
+        verify(apiService).stop();
+
+        assertEquals(STOPPED, cut.lifecycleState());
+        RxJavaPlugins.reset();
+    }
+
+    @Test
+    void shouldNotWaitForPendingRequestWhenNodeIsShutdown() throws Exception {
+        when(node.lifecycleState()).thenReturn(STOPPED);
+        final AtomicLong pendingRequests = new AtomicLong(1);
+        ReflectionTestUtils.setField(cut, "pendingRequests", pendingRequests);
+        cut.doStop();
+
+        verify(entrypointConnectorResolver).preStop();
+        verify(entrypointConnectorResolver).stop();
+        verify(endpointManager).preStop();
+        verify(endpointManager).stop();
+        verify(resourceLifecycleManager).stop();
+        verify(policyManager).stop();
+        verify(apiService).stop();
+    }
+
+    @Test
+    void shouldIgnoreErrorAndContinueWhenErrorOccurredDuringStop() throws Exception {
+        when(node.lifecycleState()).thenReturn(STOPPED);
+        when(entrypointConnectorResolver.stop()).thenThrow(new RuntimeException("Mock exception"));
+        cut.stop();
+
+        verify(entrypointConnectorResolver).preStop();
+        verify(entrypointConnectorResolver).stop();
+        verify(endpointManager).preStop();
+        verify(endpointManager, never()).stop();
+        verify(resourceLifecycleManager, never()).stop();
+        verify(policyManager, never()).stop();
+        verify(apiService).stop();
+    }
+
+    @Test
+    void shouldExecuteErrorChainWhenOrganizationResponseFlowThrowsInterruptionFailureException() {
+        // Simulate the organization response flow chain throwing an InterruptionFailureException
+        // (e.g., Groovy policy at ORG level setting State.FAILURE)
+        ExecutionFailure executionFailure = new ExecutionFailure(500).key("INTERNAL_SYSTEM_ERROR").message("Custom error from org policy");
+        spyResponsePlatformFlowChain = spy(Completable.error(new InterruptionFailureException(executionFailure)));
+        when(platformFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // The onErrorProcessors should be invoked to properly handle the failure
+        verify(spyOnErrorProcessors, times(1)).subscribe(any(CompletableObserver.class));
+
+        // The response should NOT be set to a generic 500 by handleUnexpectedError
+        verify(response, never()).status(HttpResponseStatus.INTERNAL_SERVER_ERROR.code());
+        verify(response, never()).reason(HttpResponseStatus.INTERNAL_SERVER_ERROR.reasonPhrase());
+    }
+
+    @Test
+    void shouldCompleteNormallyWhenOrganizationResponseFlowThrowsInterruptionException() {
+        spyResponsePlatformFlowChain = spy(Completable.error(new InterruptionException()));
+        when(platformFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Plain interruption from org flow should NOT trigger error processors or generic 500
+        verify(spyOnErrorProcessors, never()).subscribe(any(CompletableObserver.class));
+        verify(response, never()).status(HttpResponseStatus.INTERNAL_SERVER_ERROR.code());
+    }
+
+    @Test
+    void shouldFallbackToUnexpectedErrorWhenOrganizationResponseFlowThrowsRuntimeException() {
+        spyResponsePlatformFlowChain = spy(Completable.error(new RuntimeException("Unexpected org flow error")));
+        when(platformFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Unexpected errors should fall through to handleUnexpectedError
+        verify(response).status(HttpResponseStatus.INTERNAL_SERVER_ERROR.code());
+        verify(response).reason(HttpResponseStatus.INTERNAL_SERVER_ERROR.reasonPhrase());
+    }
+
+    @Test
+    void shouldAlwaysExecuteAfterHandleProcessorsWhenOrganizationResponseFlowFails() {
+        ExecutionFailure executionFailure = new ExecutionFailure(502).key("CUSTOM_ERROR");
+        spyResponsePlatformFlowChain = spy(Completable.error(new InterruptionFailureException(executionFailure)));
+        when(platformFlowChain.execute(ctx, ExecutionPhase.RESPONSE)).thenReturn(spyResponsePlatformFlowChain);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // afterHandleProcessors must always execute (metrics, logging, etc.) even after org flow errors
+        verify(spyAfterHandleProcessors).subscribe(any(CompletableObserver.class));
+    }
+
+    @Test
+    void should_record_endpoint_response_ttfb_and_fall_back_to_it_for_the_endpoint_response_time() {
+        final Metrics metrics = Metrics.builder().build();
+        when(ctx.metrics()).thenReturn(metrics);
+
+        cut.handle(ctx).test().assertComplete();
+
+        // Common origin the connectors derive the end of the response body from.
+        assertThat(metrics.getEndpointRequestStartNs()).isPositive();
+        assertThat(metrics.getEndpointResponseTtfbNs()).isNotNegative();
+        // The invoker here reports nothing beyond the response head, as a non-streaming connector would: the endpoint
+        // response time then stays the time to first byte, which is the historical behaviour.
+        assertThat(metrics.getEndpointResponseTimeNs()).isEqualTo(metrics.getEndpointResponseTtfbNs());
+        // Milliseconds are derived from the nanoseconds, rounded to the nearest, so both always agree.
+        assertThat(metrics.getEndpointResponseTtfbMs()).isEqualTo(Math.round(metrics.getEndpointResponseTtfbNs() / 1e6));
+        assertThat(metrics.getEndpointResponseTimeMs()).isEqualTo(metrics.getEndpointResponseTtfbMs());
+    }
+
+    @Test
+    void should_not_measure_the_endpoint_response_ttfb_twice() {
+        final Metrics metrics = Metrics.builder().build();
+        when(ctx.metrics()).thenReturn(metrics);
+
+        cut.handle(ctx).test().assertComplete();
+        final long ttfbNs = metrics.getEndpointResponseTtfbNs();
+
+        // handleUnexpectedError computes it again on its own path; a second pass must not restart the measure.
+        cut.handleUnexpectedError(ctx, new Exception("Mock exception")).test().assertComplete();
+
+        assertThat(metrics.getEndpointResponseTtfbNs()).isEqualTo(ttfbNs);
+    }
+
+    private InOrder getInOrder() {
+        return inOrder(
+            spyRequestPlatformFlowChain,
+            spyBeforeSecurityChainProcessors,
+            spySecurityChain,
+            spyBeforeHandleProcessors,
+            spyAfterHandleProcessors,
+            spyBeforeApiExecutionProcessors,
+            spyEntrypointRequest,
+            spyRequestPlanFlowChain,
+            spyRequestApiFlowChain,
+            spyInvokerChain,
+            spyResponsePlanFlowChain,
+            spyResponseApiFlowChain,
+            spyResponsePlatformFlowChain,
+            spyAfterApiExecutionProcessors,
+            spyOnErrorProcessors,
+            spyEntrypointResponse,
+            spyResponseEnd
+        );
+    }
+
+    @Nested
+    class Resources {
+
+        @Test
+        void should_return_the_started_resource_of_the_given_name_and_type() {
+            Resource resource = mock(Resource.class);
+            when(resourceLifecycleManager.getResource("oauth2-resource", Resource.class)).thenReturn(resource);
+
+            assertThat(cut.resource("oauth2-resource", Resource.class)).contains(resource);
+        }
+
+        @Test
+        void should_return_empty_when_the_api_declares_no_such_resource() {
+            when(resourceLifecycleManager.getResource("unknown", Resource.class)).thenReturn(null);
+
+            assertThat(cut.resource("unknown", Resource.class)).isEmpty();
+        }
+    }
+}

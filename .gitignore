@@ -1,0 +1,132 @@
+!.gitignore
+
+**/target/
+.idea/
+*.iml
+.DS_Store
+.*.settings.xml
+gravitee.*.log.*/*.log
+**/.logs
+
+# eclipse
+.settings/
+.project
+.classpath
+/bin/
+
+# Related to UI Console and Portal
+**/.tmp/
+**/coverage/
+**/dist/
+**/dist-tsc/
+**/node_modules/
+**/npm-debug.log
+gravitee-**-webui/node/
+**/.settings
+**/report.*.json
+**/.vscode
+**/storybook-static
+**/.angular
+package-lock.json
+
+# used in makefile as working directory
+.working/
+# used in makefile for docker-compose quick setups
+docker/quick-setup/**/.data
+docker/quick-setup/**/.certificates
+docker/quick-setup/**/.plugins
+docker/quick-setup/**/.license
+docker/quick-setup/**/.driver
+
+# used by helm charts
+helm/**/*.tgz
+
+# secrets (password to artifactory)
+gpg.script.snippet.sh
+# -- Cicd : The [graviteebot.gpg.priv.key] file contains secrets
+# which should not be commited
+graviteebot.gpg.priv.key
+# -- Cicd : The [.secrethub.credential] file contains secrets
+# which should not be commited
+graviteebot.gpg.pub.key
+# -- Cicd : The [.secrets.json] file contains secrets
+# which should not be commited
+.secrets.json
+
+# Cypress
+gravitee-apim-distribution/gravitee-apim-distribution-e2e/ui-test/videos/
+gravitee-apim-distribution/gravitee-apim-distribution-e2e/ui-test/screenshots/
+
+# Deepcode (Snyk Code) cache
+**/.dccache
+
+# Exclude flattened version of the pom, for details see https://maven.apache.org/maven-ci-friendly.html#install-deploy
+.flattened-pom.xml
+
+# Nx
+**/.nx/cache*
+.nx/workspace-data
+.nx/polygraph
+.cursor/rules/nx-rules.mdc
+.github/instructions/nx.instructions.md
+
+# Yarn
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+
+# project's maven repo
+/.m2/repository
+/.mvn/jvm.config
+/.mvn/maven.config
+
+# Claude configurations
+.claude
+
+# AI agent skills, installed locally per developer (not committed)
+.agents/skills/
+
+# Gamma 
+.worktrees
+.specs
+.c4
+
+# Impeccable
+*/**/impeccable/*
+DESIGN.md
+PRODUCT.md
+/.impeccable/*
+
+# AI context: local CLAUDE.md files are generated per developer; only the committed shims below stay tracked
+CLAUDE.md
+!/CLAUDE.md
+!/.ai/CLAUDE.md
+!/gravitee-apim-common/CLAUDE.md
+!/gravitee-apim-console-webui/CLAUDE.md
+!/gravitee-apim-definition/CLAUDE.md
+!/gravitee-apim-distribution/CLAUDE.md
+!/gravitee-apim-distribution/gravitee-apim-distribution-integration-tests/CLAUDE.md
+!/gravitee-apim-gateway/CLAUDE.md
+!/gravitee-apim-plugin/CLAUDE.md
+!/gravitee-apim-portal-webui/CLAUDE.md
+!/gravitee-apim-portal-webui-next/CLAUDE.md
+!/gravitee-apim-reporter/CLAUDE.md
+!/gravitee-apim-repository/CLAUDE.md
+!/gravitee-apim-rest-api/CLAUDE.md
+!/gravitee-apim-rest-api/gravitee-apim-rest-api-automation/CLAUDE.md
+!/gravitee-apim-webui-libs/gravitee-dashboard/CLAUDE.md
+!/gravitee-apim-webui-libs/gravitee-kafka-explorer/CLAUDE.md
+!/gravitee-apim-webui-libs/gravitee-markdown/CLAUDE.md
+!/gravitee-gamma/gamma-ui-shared/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-control-plane-webui/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-definition-model/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-module-apim/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-module-platform/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-module-portals/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-plugin/CLAUDE.md
+!/gravitee-gamma/gravitee-gamma-rest-api/CLAUDE.md

@@ -1,0 +1,131 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.synchronizer.api;
+
+import io.gravitee.common.event.EventManager;
+import io.gravitee.gateway.handlers.api.event.ApiProductChangedEvent;
+import io.gravitee.gateway.handlers.api.event.ApiProductEventType;
+import io.gravitee.gateway.handlers.api.manager.ApiManager;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.disposables.CompositeDisposable;
+import io.reactivex.rxjava3.observers.DisposableCompletableObserver;
+import io.reactivex.rxjava3.schedulers.Schedulers;
+import java.util.Set;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.function.BooleanSupplier;
+import lombok.CustomLog;
+
+/**
+ * Subscribes to API Product DEPLOY / UPDATE events and runs a single ordered
+ * pipeline on the sync deployer thread pool:
+ * <ol>
+ *   <li>Re-sync member APIs (deploy newly-eligible ones via the normal sync path)</li>
+ *   <li>Re-evaluate shard eligibility and undeploy any APIs that are no longer eligible</li>
+ * </ol>
+ * This ordering guarantees that a newly-eligible API is deployed <em>before</em>
+ * an ineligible one is undeployed, eliminating the brief unavailability window
+ * that would occur if undeploy were handled independently.
+ *
+ * <p>Only runs once the initial synchronization is over: before that, the API synchronizer
+ * deploys every member API on its own.</p>
+ */
+@CustomLog
+public class RepositoryApiMemberResyncTrigger {
+
+    private final ApiSynchronizer apiSynchronizer;
+    private final ApiManager apiManager;
+    private final ThreadPoolExecutor syncDeployerExecutor;
+    private final BooleanSupplier initialSyncDone;
+    private final CompositeDisposable disposables = new CompositeDisposable();
+
+    public RepositoryApiMemberResyncTrigger(
+        ApiSynchronizer apiSynchronizer,
+        ApiManager apiManager,
+        ThreadPoolExecutor syncDeployerExecutor,
+        EventManager eventManager,
+        BooleanSupplier initialSyncDone
+    ) {
+        this.apiSynchronizer = apiSynchronizer;
+        this.apiManager = apiManager;
+        this.syncDeployerExecutor = syncDeployerExecutor;
+        this.initialSyncDone = initialSyncDone;
+
+        eventManager.subscribeForEvents(
+            event -> {
+                if (event.content() instanceof ApiProductChangedEvent productEvent) {
+                    handleProductChange(productEvent.getProductId(), productEvent.getEnvironmentId(), productEvent.getApiIds());
+                }
+            },
+            ApiProductEventType.DEPLOY,
+            ApiProductEventType.UPDATE
+        );
+    }
+
+    private void handleProductChange(String productId, String environmentId, Set<String> apiIds) {
+        if (environmentId == null || apiIds == null || apiIds.isEmpty()) {
+            return;
+        }
+        // API Products are synchronized before APIs (Order.API_PRODUCT < Order.API), so during the
+        // initial synchronization every member API is about to be deployed by the API synchronizer
+        // anyway. Resyncing here would reload and redeploy all of them for nothing — and hold their
+        // events in memory while doing so, on the very path where the node is heaviest.
+        if (!initialSyncDone.getAsBoolean()) {
+            log.debug("Initial synchronization still running — skipping resync of {} member API(s)", apiIds.size());
+            return;
+        }
+        Completable pipeline = Completable.defer(() -> {
+            log.debug("Scheduling resync of {} member API(s) in environment [{}]", apiIds.size(), environmentId);
+            return apiSynchronizer
+                .resyncMemberApis(apiIds, Set.of(environmentId))
+                .andThen(
+                    Completable.fromAction(() -> {
+                        log.debug("Resync done — re-evaluating eligibility of {} API(s) for product [{}]", apiIds.size(), productId);
+                        apiManager.reEvaluateAfterProductChange(productId, apiIds);
+                    })
+                );
+        }).subscribeOn(Schedulers.from(syncDeployerExecutor));
+
+        // The observer knows its own identity from the start, so it can take itself out of the
+        // composite whatever the order of events. Capturing the Disposable returned by subscribe()
+        // could not: a pipeline finishing first would find nothing to remove, and the entry added
+        // afterwards would stay forever.
+        DisposableCompletableObserver observer = new DisposableCompletableObserver() {
+            @Override
+            public void onComplete() {
+                log.debug("Member API resync + re-evaluation completed for product [{}] in env [{}]", productId, environmentId);
+                disposables.delete(this);
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                log.error(
+                    "Member API resync pipeline failed for product [{}] in env [{}]: {}",
+                    productId,
+                    environmentId,
+                    error.getMessage(),
+                    error
+                );
+                disposables.delete(this);
+            }
+        };
+        disposables.add(observer);
+        pipeline.subscribe(observer);
+    }
+
+    public void dispose() {
+        disposables.dispose();
+    }
+}

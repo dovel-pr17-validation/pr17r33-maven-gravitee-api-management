@@ -1,0 +1,130 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.v4.processor.logging;
+
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_API;
+
+import io.gravitee.gateway.reactive.api.ExecutionWarn;
+import io.gravitee.gateway.reactive.api.context.ContextAttributes;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.api.context.http.HttpPlainRequest;
+import io.gravitee.gateway.reactive.api.context.http.HttpPlainResponse;
+import io.gravitee.gateway.reactive.core.condition.ExpressionLanguageConditionFilter;
+import io.gravitee.gateway.reactive.core.context.HttpExecutionContextInternal;
+import io.gravitee.gateway.reactive.core.context.HttpRequestInternal;
+import io.gravitee.gateway.reactive.core.context.HttpResponseInternal;
+import io.gravitee.gateway.reactive.core.processor.Processor;
+import io.gravitee.gateway.reactive.core.v4.analytics.AnalyticsContext;
+import io.gravitee.gateway.reactive.core.v4.analytics.LoggingContext;
+import io.gravitee.gateway.reactive.handlers.api.v4.analytics.logging.request.LogEndpointRequest;
+import io.gravitee.gateway.reactive.handlers.api.v4.analytics.logging.request.LogEntrypointRequest;
+import io.gravitee.gateway.reactive.handlers.api.v4.analytics.logging.response.LogEndpointResponse;
+import io.gravitee.gateway.reactive.handlers.api.v4.analytics.logging.response.LogEntrypointResponse;
+import io.gravitee.reporter.api.v4.log.Log;
+import io.reactivex.rxjava3.core.Completable;
+import lombok.CustomLog;
+
+/**
+ * Processor in charge of initializing the {@link Log} entity during the request phase if logging condition is evaluated to true.
+ *
+ * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+public class LogInitProcessor implements Processor {
+
+    public static final String ID = "processor-init-logging";
+    private static final ExpressionLanguageConditionFilter<LoggingContext> CONDITION_FILTER = new ExpressionLanguageConditionFilter<>();
+
+    public static LogInitProcessor instance() {
+        return Holder.INSTANCE;
+    }
+
+    @Override
+    public String getId() {
+        return ID;
+    }
+
+    @Override
+    public Completable execute(final HttpExecutionContextInternal ctx) {
+        return Completable.defer(() -> {
+            final AnalyticsContext analyticsContext = ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_ANALYTICS_CONTEXT);
+
+            if (!analyticsContext.isLoggingEnabled()) {
+                return Completable.complete();
+            }
+
+            final LoggingContext loggingContext = analyticsContext.getLoggingContext();
+            return CONDITION_FILTER.filter(ctx, loggingContext)
+                // The filter propagates a condition that cannot be parsed, so that a broken policy condition fails closed.
+                // Logging enforces nothing: a condition it cannot evaluate only skips logging, never the request.
+                .doOnError(throwable -> reportUnusableCondition(ctx, loggingContext.getCondition(), throwable))
+                .onErrorComplete()
+                .doOnSuccess(activeLoggingContext -> initLogEntity(ctx, activeLoggingContext))
+                .ignoreElement();
+        });
+    }
+
+    private void reportUnusableCondition(final HttpExecutionContextInternal ctx, final String condition, final Throwable throwable) {
+        // A condition that cannot be parsed fails identically on every request: a stack trace each time would flood the log.
+        ctx.withLogger(log).warn("Logging condition {} cannot be evaluated, logging is skipped: {}", condition, throwable.getMessage());
+        ctx.withLogger(log).debug("Logging condition {} evaluation failure", condition, throwable);
+        ctx.warnWith(
+            new ExecutionWarn("EXPRESSION_EVALUATION_ERROR")
+                .message("Unable to execute logging condition " + condition + ", logging is skipped")
+                .cause(throwable)
+        );
+    }
+
+    private void initLogEntity(final HttpExecutionContextInternal ctx, final LoggingContext loggingContext) {
+        HttpRequestInternal request = ctx.request();
+        HttpResponseInternal response = ctx.response();
+
+        Log log = Log.builder()
+            .timestamp(request.timestamp())
+            .requestId(request.id())
+            .clientIdentifier(request.clientIdentifier())
+            .apiId(ctx.getAttribute(ATTR_API))
+            .apiName(ctx.getAttribute(ContextAttributes.ATTR_API_NAME))
+            .organizationId(ctx.metrics().getOrganizationId())
+            .environmentId(ctx.metrics().getEnvironmentId())
+            .targets(loggingContext.computeReportTargets())
+            .build();
+        ctx.metrics().setLog(log);
+
+        if (loggingContext.entrypointRequest()) {
+            final LogEntrypointRequest logRequest = new LogEntrypointRequest(loggingContext, request);
+            log.setEntrypointRequest(logRequest);
+        }
+        if (loggingContext.entrypointResponse()) {
+            final LogEntrypointResponse logResponse = new LogEntrypointResponse(loggingContext, response);
+            log.setEntrypointResponse(logResponse);
+        }
+        if (loggingContext.endpointRequest()) {
+            final LogEndpointRequest logRequest = new LogEndpointRequest(loggingContext, request);
+            log.setEndpointRequest(logRequest);
+        }
+        if (loggingContext.endpointResponse()) {
+            final LogEndpointResponse logResponse = new LogEndpointResponse(loggingContext, response);
+            log.setEndpointResponse(logResponse);
+        }
+    }
+
+    private static class Holder {
+
+        private static final LogInitProcessor INSTANCE = new LogInitProcessor();
+    }
+}

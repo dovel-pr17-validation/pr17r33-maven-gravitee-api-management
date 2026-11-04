@@ -1,0 +1,334 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.common.deployer;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.gravitee.gateway.api.service.ApiKey;
+import io.gravitee.gateway.api.service.Subscription;
+import io.gravitee.gateway.handlers.api.services.ApiKeyCacheService;
+import io.gravitee.gateway.handlers.api.services.SubscriptionCacheService;
+import io.gravitee.gateway.services.sync.process.common.mapper.SubscriptionMapper;
+import io.gravitee.gateway.services.sync.process.common.model.SyncException;
+import io.gravitee.gateway.services.sync.process.repository.mapper.ApiKeyMapper;
+import io.gravitee.repository.exceptions.TechnicalException;
+import io.gravitee.repository.management.api.ApiKeyRepository;
+import io.gravitee.repository.management.api.SubscriptionRepository;
+import io.gravitee.repository.management.model.SubscriptionReferenceType;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.IntStream;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * @author Arpit Mishra (arpit.mishra at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@ExtendWith(MockitoExtension.class)
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+class ApiProductSubscriptionRefresherTest {
+
+    private static final String PLAN_1 = "plan-1";
+    private static final String ENV_1 = "env-1";
+    private static final String SUB_1 = "sub-1";
+    private static final String API_1 = "api-1";
+    private static final String KEY_ID = "key-id";
+    private static final String PRODUCT_1 = "product-1";
+
+    @Mock
+    private SubscriptionRepository subscriptionRepository;
+
+    @Mock
+    private ApiKeyRepository apiKeyRepository;
+
+    @Mock
+    private SubscriptionMapper subscriptionMapper;
+
+    @Mock
+    private ApiKeyMapper apiKeyMapper;
+
+    @Mock
+    private SubscriptionCacheService subscriptionService;
+
+    @Mock
+    private ApiKeyCacheService apiKeyService;
+
+    private ApiProductSubscriptionRefresher cut;
+
+    private static final int BULK_ITEMS = 100;
+    private static final int CHUNK_SIZE = 900;
+
+    @BeforeEach
+    void setUp() {
+        cut = new ApiProductSubscriptionRefresher(
+            subscriptionRepository,
+            apiKeyRepository,
+            subscriptionMapper,
+            apiKeyMapper,
+            subscriptionService,
+            apiKeyService,
+            BULK_ITEMS,
+            CHUNK_SIZE
+        );
+    }
+
+    @Nested
+    class RefreshTest {
+
+        @Test
+        void returns_complete_when_plans_null_or_empty() throws TechnicalException {
+            cut.refresh(null, Set.of(ENV_1)).test().assertComplete();
+            cut.refresh(Set.of(), Set.of(ENV_1)).test().assertComplete();
+            verify(subscriptionRepository, never()).searchAfter(any(), any(), any(), any(int.class));
+        }
+
+        @Test
+        void loads_and_deploys_subscriptions() throws TechnicalException {
+            var repoSub = productSubscription(SUB_1, PLAN_1, ENV_1);
+            var gatewaySub = Subscription.builder().id(SUB_1).api(API_1).plan(PLAN_1).build();
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of(repoSub));
+            when(subscriptionMapper.to(repoSub)).thenReturn(List.of(gatewaySub));
+
+            cut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).test().assertComplete();
+
+            verify(subscriptionService).register(gatewaySub);
+        }
+
+        /**
+         * Registering a client certificate links BouncyCastle classes lazily, so a mismatched provider on the
+         * classpath surfaces as an Error rather than an Exception. This runs inside a Completable.fromRunnable,
+         * which rethrows Errors instead of routing them to onError, so an uncaught one kills the sync thread and
+         * the node never turns ready. An API Product subscription reaches register() through quietly().
+         */
+        @Test
+        void keeps_going_when_an_item_fails_with_an_error() throws TechnicalException {
+            var repoSub1 = productSubscription(SUB_1, PLAN_1, ENV_1);
+            var repoSub2 = productSubscription("sub-2", PLAN_1, ENV_1);
+            var gatewaySub1 = Subscription.builder().id(SUB_1).api(API_1).plan(PLAN_1).build();
+            var gatewaySub2 = Subscription.builder().id("sub-2").api(API_1).plan(PLAN_1).build();
+            var repoKey = productApiKey(KEY_ID, ENV_1, SUB_1);
+            var gatewayKey = ApiKey.builder().id(KEY_ID).api(API_1).subscription(SUB_1).build();
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of(repoSub1, repoSub2));
+            when(subscriptionMapper.to(repoSub1)).thenReturn(List.of(gatewaySub1));
+            when(subscriptionMapper.to(repoSub2)).thenReturn(List.of(gatewaySub2));
+            when(apiKeyRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of(repoKey));
+            when(apiKeyMapper.to(repoKey, gatewaySub1)).thenReturn(gatewayKey);
+            doThrow(new NoSuchFieldError("BCObjectIdentifiers.sphincsPlus_sha2_128s_r3")).when(subscriptionService).register(gatewaySub1);
+            // BouncyCastle FIPS raises FipsUnapprovedOperationError, an AssertionError, which a LinkageError
+            // guard would let through. The API key branch of quietly() is otherwise never driven with an Error.
+            doThrow(new AssertionError("attempt to use unapproved algorithm")).when(apiKeyService).register(gatewayKey);
+
+            cut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).test().assertComplete();
+
+            // The failing item costs itself and nothing else: the page keeps going.
+            verify(subscriptionService).register(gatewaySub1);
+            verify(subscriptionService).register(gatewaySub2);
+            verify(apiKeyService).register(gatewayKey);
+        }
+
+        @Test
+        void loads_and_deploys_api_keys() throws TechnicalException {
+            var repoSub = productSubscription(SUB_1, PLAN_1, ENV_1);
+            var gatewaySub = Subscription.builder().id(SUB_1).api(API_1).plan(PLAN_1).build();
+            var repoKey = productApiKey(KEY_ID, ENV_1, SUB_1);
+            var gatewayKey = ApiKey.builder().id(KEY_ID).api(API_1).subscription(SUB_1).build();
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of(repoSub));
+            when(subscriptionMapper.to(repoSub)).thenReturn(List.of(gatewaySub));
+            when(apiKeyRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of(repoKey));
+            when(apiKeyMapper.to(repoKey, gatewaySub)).thenReturn(gatewayKey);
+
+            cut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).test().assertComplete();
+
+            verify(subscriptionService).register(gatewaySub);
+            verify(apiKeyService).register(gatewayKey);
+        }
+
+        @Test
+        void does_not_call_api_key_repository_when_no_subscriptions() throws TechnicalException {
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(List.of());
+
+            cut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).test().assertComplete();
+
+            verify(subscriptionRepository).searchAfter(any(), any(), any(), eq(BULK_ITEMS));
+            verify(apiKeyRepository, never()).searchAfter(any(), any(), any(), any(int.class));
+        }
+
+        @Test
+        void chunks_subscriptions_in_list_and_dedups_federated_keys_across_chunks() throws TechnicalException {
+            // 5 subscription ids → 2 chunks of size 3 (last chunk has 2). A federated api key tied
+            // to subscriptions across both chunks must be processed exactly once (its mapped
+            // gateway keys still produced — one per matched subscription).
+            var localCut = new ApiProductSubscriptionRefresher(
+                subscriptionRepository,
+                apiKeyRepository,
+                subscriptionMapper,
+                apiKeyMapper,
+                subscriptionService,
+                apiKeyService,
+                BULK_ITEMS,
+                3 // small chunk size to force chunking with 5 subs
+            );
+
+            var repoSubs = IntStream.range(0, 5)
+                .mapToObj(i -> productSubscription("sub" + i, PLAN_1, ENV_1))
+                .toList();
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenReturn(repoSubs);
+            var gatewaySubs = IntStream.range(0, 5)
+                .mapToObj(i -> Subscription.builder().id("sub" + i).api(API_1).plan(PLAN_1).build())
+                .toList();
+            for (int i = 0; i < 5; i++) {
+                when(subscriptionMapper.to(repoSubs.get(i))).thenReturn(List.of(gatewaySubs.get(i)));
+            }
+
+            // Federated key tied to sub0 (chunk 0) AND sub3 (chunk 1). With sorted IDs the chunks
+            // are deterministic: [sub0,sub1,sub2] and [sub3,sub4].
+            var federated = productApiKey("federated-key", ENV_1, "sub0");
+            federated.setSubscriptions(List.of("sub0", "sub3"));
+            var chunk1Only = productApiKey("k-chunk1", ENV_1, "sub4");
+
+            when(apiKeyRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenAnswer(invocation -> {
+                var criteria = (io.gravitee.repository.management.api.search.ApiKeyCriteria) invocation.getArgument(0);
+                if (criteria.getSubscriptions() != null && criteria.getSubscriptions().contains("sub0")) {
+                    return List.of(federated);
+                }
+                if (criteria.getSubscriptions() != null && criteria.getSubscriptions().contains("sub3")) {
+                    return List.of(federated, chunk1Only);
+                }
+                return List.of();
+            });
+            // Each (repoKey, gatewaySub) pair maps to a distinct gateway ApiKey.
+            when(apiKeyMapper.to(federated, gatewaySubs.get(0))).thenReturn(
+                ApiKey.builder().id("k-fed-sub0").api(API_1).subscription("sub0").build()
+            );
+            when(apiKeyMapper.to(federated, gatewaySubs.get(3))).thenReturn(
+                ApiKey.builder().id("k-fed-sub3").api(API_1).subscription("sub3").build()
+            );
+            when(apiKeyMapper.to(chunk1Only, gatewaySubs.get(4))).thenReturn(
+                ApiKey.builder().id("k-chunk1-sub4").api(API_1).subscription("sub4").build()
+            );
+
+            localCut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).test().assertComplete();
+
+            // With dedup: federated processed once → emits 2 mapped keys (sub0, sub3) + chunk1Only's 1 = 3 register calls.
+            // Without dedup: federated processed in both chunks → 4 federated mappings + 1 chunk1Only = 5 register calls.
+            verify(apiKeyService, org.mockito.Mockito.times(3)).register(any(ApiKey.class));
+        }
+
+        @Test
+        void throws_when_repository_fails() throws TechnicalException {
+            when(subscriptionRepository.searchAfter(any(), any(), any(), eq(BULK_ITEMS))).thenThrow(new TechnicalException("DB error"));
+
+            var thrown = catchThrowable(() -> cut.refresh(Set.of(PLAN_1), Set.of(ENV_1)).blockingAwait());
+
+            assertThat(thrown)
+                .isInstanceOf(SyncException.class)
+                .hasMessageContaining("Error occurred when retrieving subscriptions for API Product");
+            assertThat(thrown.getCause()).isInstanceOf(TechnicalException.class);
+        }
+    }
+
+    @Nested
+    class UnregisterByApiProductTest {
+
+        @Test
+        void returns_complete_when_api_product_id_is_null() throws TechnicalException {
+            cut.unregisterByApiProduct(null).test().assertComplete();
+
+            verify(subscriptionService, never()).unregisterByApiProductId(any());
+            verify(apiKeyService, never()).unregisterByApiProductId(any());
+            verify(subscriptionRepository, never()).searchAfter(any(), any(), any(), any(int.class));
+        }
+
+        @Test
+        void evicts_subscriptions_and_api_keys_of_the_product_without_hitting_the_repository() throws TechnicalException {
+            cut.unregisterByApiProduct(PRODUCT_1).test().assertComplete();
+
+            verify(subscriptionService).unregisterByApiProductId(PRODUCT_1);
+            verify(apiKeyService).unregisterByApiProductId(PRODUCT_1);
+            // Both caches index product subscriptions by product: no lookup needed to find them back
+            verify(subscriptionRepository, never()).searchAfter(any(), any(), any(), any(int.class));
+            verify(apiKeyRepository, never()).searchAfter(any(), any(), any(), any(int.class));
+        }
+
+        /**
+         * The eviction runs through {@code SyncIsolation.translateErrors}. Evicting a product subscription
+         * rebuilds the merged trust store, which is the mixed-BouncyCastle path, so the failure arrives as
+         * an Error. {@code ApiProductDeployer#undeploy} only catches Exception: left as an Error it would
+         * kill the sync thread, and swallowed it would let the undeploy report success and mark the product
+         * gone while its subscription certificates are still loaded. Translating is what keeps the caller
+         * stopping. The API key eviction must not run either — the product is not gone.
+         */
+        @Test
+        void translates_an_error_into_a_sync_exception_and_stops() {
+            var linkageError = new NoSuchFieldError("BCObjectIdentifiers.sphincsPlus_sha2_128s_r3");
+            doThrow(linkageError).when(subscriptionService).unregisterByApiProductId(PRODUCT_1);
+
+            var thrown = catchThrowable(() -> cut.unregisterByApiProduct(PRODUCT_1).blockingAwait());
+
+            assertThat(thrown).isInstanceOf(SyncException.class).hasMessageContaining(PRODUCT_1).hasCause(linkageError);
+            verify(apiKeyService, never()).unregisterByApiProductId(any());
+        }
+
+        /**
+         * Exceptions keep propagating in the shape the caller already handles: it wraps them into its own
+         * SyncException, so translating here too would only nest the message.
+         */
+        @Test
+        void lets_an_exception_propagate_untouched() {
+            var failure = new IllegalStateException("subscription cache unavailable");
+            doThrow(failure).when(subscriptionService).unregisterByApiProductId(PRODUCT_1);
+
+            var thrown = catchThrowable(() -> cut.unregisterByApiProduct(PRODUCT_1).blockingAwait());
+
+            assertThat(thrown).isSameAs(failure);
+            verify(apiKeyService, never()).unregisterByApiProductId(any());
+        }
+    }
+
+    private static io.gravitee.repository.management.model.Subscription productSubscription(String id, String plan, String env) {
+        var s = new io.gravitee.repository.management.model.Subscription();
+        s.setId(id);
+        s.setReferenceId(PRODUCT_1);
+        s.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        s.setPlan(plan);
+        s.setStatus(io.gravitee.repository.management.model.Subscription.Status.ACCEPTED);
+        s.setEnvironmentId(env);
+        return s;
+    }
+
+    private static io.gravitee.repository.management.model.ApiKey productApiKey(String id, String env, String subscriptionId) {
+        var k = new io.gravitee.repository.management.model.ApiKey();
+        k.setId(id);
+        k.setKey("key-" + id);
+        k.setSubscriptions(List.of(subscriptionId));
+        k.setEnvironmentId(env);
+        return k;
+    }
+}

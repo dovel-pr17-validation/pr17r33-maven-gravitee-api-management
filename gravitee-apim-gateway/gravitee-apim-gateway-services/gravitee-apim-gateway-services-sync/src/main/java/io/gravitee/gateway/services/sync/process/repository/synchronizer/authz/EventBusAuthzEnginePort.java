@@ -1,0 +1,408 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.synchronizer.authz;
+
+import io.reactivex.rxjava3.core.Completable;
+import io.vertx.core.eventbus.DeliveryOptions;
+import io.vertx.core.json.JsonArray;
+import io.vertx.core.json.JsonObject;
+import io.vertx.rxjava3.core.Vertx;
+import io.vertx.rxjava3.core.eventbus.Message;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import lombok.CustomLog;
+
+@CustomLog
+public class EventBusAuthzEnginePort implements AuthzEnginePort {
+
+    public static final String SCOPE_ADDRESS_PREFIX = "service:authz-pdp:sync:scope:";
+    public static final String DEFAULT_ADDRESS = "service:authz-pdp:sync";
+    static final String WILDCARD = "*";
+    static final String DEFAULT_SCOPE = "default";
+    // A routing scope is "<targetPdpId>@<tag>" when tagged (e.g. "default@us", "orders@eu"), else the bare
+    // targetPdpId. The tag selects WHERE the engine runs (enforced by AuthzHostedScopes#serves), not the
+    // engine address: the address is derived from the targetPdpId part only, so "orders@us" and "orders@eu"
+    // alias to the same per-scope engine address yet are hosted on different nodes.
+    static final String SCOPE_TAG_SEPARATOR = "@";
+
+    static final String OP_ADD_OR_UPDATE_ENTITY = "addOrUpdateEntity";
+    static final String OP_REMOVE_ENTITY = "removeEntity";
+    static final String OP_ADD_OR_UPDATE_POLICY = "addOrUpdatePolicy";
+    static final String OP_REMOVE_POLICY = "removePolicy";
+    static final String OP_ADD_OR_UPDATE_SCHEMA = "addOrUpdateSchema";
+    static final String OP_REMOVE_SCHEMA = "removeSchema";
+    static final String OP_COMMIT = "commit";
+    static final String ENVIRONMENT_ID = "environmentId";
+
+    // Vertx default reply timeout is 30s — long enough to wedge a sync cycle when the PDP service
+    // is unhealthy. 5s is short enough to fail fast and long enough for normal in-process replies.
+    static final long REPLY_TIMEOUT_MS = 5_000L;
+    // Cap commit re-arming so a permanently dead scope stops paying a full reply timeout every cycle.
+    static final int MAX_COMMIT_ATTEMPTS = 10;
+
+    private final Vertx vertx;
+    private final AuthzHostedScopes hostedScopes;
+    private final AuthzAppliedRevisions revisions;
+    private final DeliveryOptions deliveryOptions = new DeliveryOptions().setSendTimeout(REPLY_TIMEOUT_MS);
+    private final Set<String> touched = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> commitAttempts = new ConcurrentHashMap<>();
+    // Revisions marked applied against an address but not yet sealed by a successful commit. Kept so that when
+    // a commit to that address is abandoned (past MAX_COMMIT_ATTEMPTS) the marks can be rolled back, otherwise
+    // the gate would suppress a re-stage forever and the scope would sit permanently uncommitted.
+    private final Map<String, Set<RevisionRef>> pendingByAddress = new ConcurrentHashMap<>();
+
+    private record RevisionRef(String environmentId, String scope, String docId) {}
+
+    public EventBusAuthzEnginePort(Vertx vertx, AuthzHostedScopes hostedScopes, AuthzAppliedRevisions revisions) {
+        this.vertx = Objects.requireNonNull(vertx, "vertx must not be null");
+        this.hostedScopes = Objects.requireNonNull(hostedScopes, "hostedScopes must not be null");
+        this.revisions = Objects.requireNonNull(revisions, "revisions must not be null");
+    }
+
+    private static String addressFor(String environmentId, String scope) {
+        // Derive the engine address from the targetPdpId part only (strip "@tag"): a tagged scope aliases to
+        // its base engine and tag scoping is enforced by AuthzHostedScopes#serves, not by a distinct address.
+        // ("*" is expanded to concrete scopes before reaching here — see route()/expandWildcard.)
+        String base = baseScope(scope);
+        if (DEFAULT_SCOPE.equals(base)) {
+            return DEFAULT_ADDRESS;
+        }
+        return SCOPE_ADDRESS_PREFIX + environmentId + ":" + base;
+    }
+
+    static String baseScope(String scope) {
+        int at = scope.indexOf(SCOPE_TAG_SEPARATOR);
+        return at >= 0 ? scope.substring(0, at) : scope;
+    }
+
+    @Override
+    public Completable addOrUpdateEntity(
+        String environmentId,
+        String uid,
+        Map<String, Object> attributes,
+        List<String> parents,
+        Set<String> targetPdpIds,
+        long updatedAt
+    ) {
+        JsonObject command = new JsonObject().put("op", OP_ADD_OR_UPDATE_ENTITY).put("uid", uid);
+        if (attributes != null && !attributes.isEmpty()) {
+            command.put("attributes", new JsonObject(attributes));
+        }
+        if (parents != null && !parents.isEmpty()) {
+            command.put("parents", new JsonArray(parents));
+        }
+        return routeGated(environmentId, command, expandWildcard(environmentId, targetPdpIds), uid, updatedAt);
+    }
+
+    @Override
+    public Completable removeEntity(String environmentId, String uid, Set<String> targetPdpIds) {
+        return routeForget(
+            environmentId,
+            new JsonObject().put("op", OP_REMOVE_ENTITY).put("uid", uid),
+            expandWildcard(environmentId, targetPdpIds),
+            uid
+        );
+    }
+
+    @Override
+    public Completable addOrUpdatePolicy(
+        String environmentId,
+        String docId,
+        String name,
+        String policyText,
+        Set<String> targetPdpIds,
+        long updatedAt,
+        String revision
+    ) {
+        JsonObject command = new JsonObject()
+            .put("op", OP_ADD_OR_UPDATE_POLICY)
+            .put("docId", docId)
+            .put("name", name)
+            .put("policyText", policyText);
+        if (revision != null) {
+            command.put("revision", revision);
+        }
+        return routeGated(environmentId, command, expandWildcard(environmentId, targetPdpIds), docId, updatedAt);
+    }
+
+    @Override
+    public Completable removePolicy(String environmentId, String docId, Set<String> targetPdpIds) {
+        return routeForget(
+            environmentId,
+            new JsonObject().put("op", OP_REMOVE_POLICY).put("docId", docId),
+            expandWildcard(environmentId, targetPdpIds),
+            docId
+        );
+    }
+
+    @Override
+    public Completable addOrUpdateSchema(
+        String environmentId,
+        String docId,
+        String name,
+        String schemaText,
+        Set<String> targetPdpIds,
+        long updatedAt
+    ) {
+        // The PDP reads docId and schemaText (and the environmentId routeGated adds); name stays on the deployable
+        // for gateway-side logging.
+        JsonObject command = new JsonObject().put("op", OP_ADD_OR_UPDATE_SCHEMA).put("docId", docId).put("schemaText", schemaText);
+        Set<String> scopes = expandWildcardWithoutBootstrap(environmentId, targetPdpIds);
+        warnOnceIfWildcardReachesNothing(environmentId, docId, targetPdpIds, scopes, updatedAt);
+        return routeGated(environmentId, command, scopes, docId, updatedAt);
+    }
+
+    @Override
+    public Completable removeSchema(String environmentId, String docId, Set<String> targetPdpIds) {
+        return routeForget(
+            environmentId,
+            new JsonObject().put("op", OP_REMOVE_SCHEMA).put("docId", docId),
+            expandWildcardWithoutBootstrap(environmentId, targetPdpIds),
+            docId
+        );
+    }
+
+    @Override
+    public Completable commit() {
+        return Completable.defer(this::commitTouchedSnapshot);
+    }
+
+    private Completable commitTouchedSnapshot() {
+        List<String> addresses = new ArrayList<>(touched);
+        // Remove only the snapshot we are committing; an address armed by another thread between the
+        // copy and here survives for the next cycle instead of being silently dropped (clear() race).
+        touched.removeAll(addresses);
+        if (addresses.isEmpty()) {
+            return Completable.complete();
+        }
+        List<Completable> commits = new ArrayList<>(addresses.size());
+        for (String address : addresses) {
+            commits.add(commitOne(address));
+        }
+        return Completable.merge(commits);
+    }
+
+    @Override
+    public Completable commitScope(String environmentId, String targetPdpId) {
+        return Completable.defer(() -> {
+            String address = addressFor(environmentId, targetPdpId);
+            // Commit only this scope's address. Draining the shared touched set here would couple this
+            // scope's commit latency and failures to every other armed scope sharing this port, so a
+            // single dead scope could stall every provision's hydration.
+            touched.remove(address);
+            return commitOne(address);
+        });
+    }
+
+    private Completable commitOne(String address) {
+        return Completable.defer(() -> {
+            // Take ownership of the revisions this commit is sealing (mirrors the touched snapshot): marks
+            // armed by a mutation that completes after this point stay pending for the next commit.
+            Set<RevisionRef> sealing = pendingByAddress.remove(address);
+            JsonObject c = new JsonObject().put("op", OP_COMMIT);
+            return vertx
+                .eventBus()
+                .<JsonObject>rxRequest(address, c, deliveryOptions)
+                .flatMapCompletable(this::verifyCommitReply)
+                // Commit sealed the generation: the marks are now durable, drop the snapshot without rolling back.
+                .doOnComplete(() -> commitAttempts.remove(address))
+                .onErrorComplete(t -> {
+                    int attempts = commitAttempts.merge(address, 1, Integer::sum);
+                    if (attempts > MAX_COMMIT_ATTEMPTS) {
+                        commitAttempts.remove(address);
+                        // Give up: the staged mutations were never sealed, so roll back their revision marks —
+                        // otherwise the gate suppresses the re-stage forever and the scope stays uncommitted.
+                        forgetPending(sealing);
+                        log.warn(
+                            "Abandoning authz PDP commit to address [{}] after {} attempts; rolled back {} unsealed revision(s) so they re-stage next cycle",
+                            address,
+                            attempts - 1,
+                            sealing == null ? 0 : sealing.size()
+                        );
+                        return true;
+                    }
+                    // Re-arm the address AND keep owning the unsealed marks so the next cycle's commit retries
+                    // and can still roll them back if it ultimately gives up.
+                    rearmPending(address, sealing);
+                    touched.add(address);
+                    log.warn("Authz PDP commit to address [{}] failed (attempt {}), will retry next cycle", address, attempts, t);
+                    return true;
+                });
+        });
+    }
+
+    private void forgetPending(Set<RevisionRef> refs) {
+        if (refs == null) {
+            return;
+        }
+        refs.forEach(r -> revisions.forget(r.environmentId(), r.scope(), r.docId()));
+    }
+
+    private void rearmPending(String address, Set<RevisionRef> refs) {
+        if (refs == null || refs.isEmpty()) {
+            return;
+        }
+        pendingByAddress.computeIfAbsent(address, k -> ConcurrentHashMap.newKeySet()).addAll(refs);
+    }
+
+    private Completable routeGated(String environmentId, JsonObject command, Set<String> scopes, String docId, long updatedAt) {
+        if (scopes.isEmpty()) {
+            return Completable.complete();
+        }
+        command.put(ENVIRONMENT_ID, environmentId);
+        List<Completable> sends = new ArrayList<>();
+        for (String scope : scopes) {
+            if (!hostedScopes.serves(environmentId, scope)) {
+                continue;
+            }
+            if (!revisions.shouldApply(environmentId, scope, docId, updatedAt)) {
+                continue;
+            }
+            String address = addressFor(environmentId, scope);
+            sends.add(
+                vertx
+                    .eventBus()
+                    .<JsonObject>rxRequest(address, command, deliveryOptions)
+                    .ignoreElement()
+                    .doOnComplete(() -> {
+                        revisions.markApplied(environmentId, scope, docId, updatedAt);
+                        pendingByAddress
+                            .computeIfAbsent(address, k -> ConcurrentHashMap.newKeySet())
+                            .add(new RevisionRef(environmentId, scope, docId));
+                        touched.add(address);
+                    })
+            );
+        }
+        return Completable.merge(sends);
+    }
+
+    private Completable routeForget(String environmentId, JsonObject command, Set<String> scopes, String docId) {
+        if (scopes.isEmpty()) {
+            return Completable.complete();
+        }
+        command.put(ENVIRONMENT_ID, environmentId);
+        List<Completable> sends = new ArrayList<>();
+        for (String scope : scopes) {
+            if (!hostedScopes.serves(environmentId, scope)) {
+                continue;
+            }
+            String address = addressFor(environmentId, scope);
+            if (appliedOnAnotherScope(environmentId, scope, scopes, docId)) {
+                // Another scope keeps the document on this shared engine.
+                revisions.forget(environmentId, scope, docId);
+                continue;
+            }
+            sends.add(
+                vertx
+                    .eventBus()
+                    .<JsonObject>rxRequest(address, command, deliveryOptions)
+                    .ignoreElement()
+                    .doOnComplete(() -> {
+                        revisions.forget(environmentId, scope, docId);
+                        touched.add(address);
+                    })
+            );
+        }
+        return Completable.merge(sends);
+    }
+
+    // The engine a routing scope lands on is its base (addressFor strips the tag), so the scopes sharing an
+    // engine with it are exactly its hostedByBase bucket — no need to scan every environment's scopes and
+    // compare addresses.
+    private boolean appliedOnAnotherScope(String environmentId, String scope, Set<String> removedScopes, String docId) {
+        return hostedScopes
+            .hostedOnEngine(environmentId, scope)
+            .stream()
+            .filter(other -> !removedScopes.contains(other))
+            .anyMatch(other -> revisions.isApplied(environmentId, other, docId));
+    }
+
+    // "*" means every engine in the environment. On a given node that is the set of scopes the node
+    // actually hosts (it is the authority for its own placement, via AuthzHostedScopes) plus the always-on
+    // default engine. Expanding to those and routing per-scope gives confirmed, retried delivery — unlike a
+    // fire-and-forget broadcast — and a scope provisioned later is backfilled by the hydration path.
+    private Set<String> expandWildcard(String environmentId, Set<String> targetPdpIds) {
+        if (targetPdpIds == null || targetPdpIds.isEmpty()) {
+            return Set.of();
+        }
+        if (!targetPdpIds.contains(WILDCARD)) {
+            return targetPdpIds;
+        }
+        Set<String> expanded = new LinkedHashSet<>(targetPdpIds);
+        expanded.remove(WILDCARD);
+        expanded.addAll(hostedScopes.hostedFor(environmentId));
+        expanded.add(DEFAULT_SCOPE);
+        return expanded;
+    }
+
+    // D7: "*" on a schema means every NAMED engine of the environment. Unlike expandWildcard it does not
+    // add the bootstrap engine, which is shared across environments — a wildcard schema landing there would
+    // merge two environments' contracts into one. Targeting "default" explicitly still works.
+    // A wildcard schema reaches only NAMED engines (D7), so on a node hosting none it expands to nothing and
+    // no command is sent. Policies never hit this, because their wildcard always includes the bootstrap
+    // engine, so the silence is specific to schema and would otherwise leave a single-node install running
+    // policies against no schema at all with nothing in the log to say so.
+    // Deduplicated on the document's revision, because the resync window re-delivers the same event once per
+    // cycle for its whole duration and an ungated warning would repeat with it. Only the publish path warns:
+    // an empty expansion on removal simply means there is nothing to remove.
+    private void warnOnceIfWildcardReachesNothing(
+        String environmentId,
+        String docId,
+        Set<String> targetPdpIds,
+        Set<String> expanded,
+        long updatedAt
+    ) {
+        if (!expanded.isEmpty() || targetPdpIds == null || !targetPdpIds.contains(WILDCARD)) {
+            return;
+        }
+        if (revisions.shouldApply(environmentId, WILDCARD, docId, updatedAt)) {
+            revisions.markApplied(environmentId, WILDCARD, docId, updatedAt);
+            log.warn(
+                "Authz schema '{}' targets every named engine of environment [{}], which hosts none, so it reaches nothing",
+                docId,
+                environmentId
+            );
+        }
+    }
+
+    private Set<String> expandWildcardWithoutBootstrap(String environmentId, Set<String> targetPdpIds) {
+        if (targetPdpIds == null || targetPdpIds.isEmpty()) {
+            return Set.of();
+        }
+        if (!targetPdpIds.contains(WILDCARD)) {
+            return targetPdpIds;
+        }
+        Set<String> expanded = new LinkedHashSet<>(targetPdpIds);
+        expanded.remove(WILDCARD);
+        expanded.addAll(hostedScopes.hostedFor(environmentId));
+        return expanded;
+    }
+
+    private Completable verifyCommitReply(Message<JsonObject> reply) {
+        JsonObject body = reply.body();
+        Long gen = body != null ? body.getLong("commitGeneration") : null;
+        if (gen == null) {
+            return Completable.error(new IllegalStateException("Authz PDP commit reply missing 'commitGeneration': " + body));
+        }
+        log.debug("Authz engine commit landed, commitGeneration={}", gen);
+        return Completable.complete();
+    }
+}

@@ -1,0 +1,204 @@
+---
+name: Gamma Clean Architecture
+layer: local
+dirs:
+  - gravitee-gamma/gravitee-gamma-module-apim
+  - gravitee-gamma/gravitee-gamma-module-platform
+  - gravitee-gamma/gravitee-gamma-module-portals
+  - gravitee-gamma/gravitee-gamma-rest-api
+description: The Clean Architecture conventions shared by all gamma modules - package layout, naming, use cases, core independence, adapters, REST, and the fixtures-first testing stack
+# Maintainer note (source-only): the hub's gamma product rule carries an outline of this
+# architecture for product-gamma repos; this rule is the richer copy and leads when the
+# two diverge.
+---
+
+# Gamma Clean Architecture
+
+All gamma backend code follows **Clean Architecture** (Hexagonal). These rules mirror the patterns established in `gravitee-apim-rest-api-service` under `io.gravitee.apim.core` / `io.gravitee.apim.infra`, using shared annotations and base classes from `gravitee-apim-common`.
+
+Gamma source files cite these sections as "AGENTS.md §n" (pom.xml comments, ArchUnit tests, configuration classes) — the numbering below is what those citations refer to, so keep it stable when editing. §11 is taken by the host application rule.
+
+## 1. Package Layout
+
+Each domain within a module follows this structure (package root `io.gravitee.gamma.module.<module>`; the host application in `gravitee-gamma/gravitee-gamma-rest-api` deviates per its own rule):
+
+```
+io.gravitee.gamma.module.<module>/
+├── rest/
+│   ├── resource/                      # JAX-RS resources
+│   ├── exception/                     # Exception handlers
+├── core/                              # Business logic (framework-free)
+│   ├── <domain>/
+│   │   ├── model/                     # Domain entities, value objects
+│   │   ├── use_case/                  # One class per user/system action
+│   │   ├── domain_service/            # Reusable cross-use-case business logic
+│   │   ├── exception/                 # Domain-specific exceptions
+│   │   └── port/
+│   │       ├── repository/            # Ports onto a data store the module owns
+│   │       └── service_provider/      # Ports onto an external service / SPI
+└── infra/                             # Framework & persistence wiring
+    ├── repository/<domain>/           # Repository implementations (Spring @Repository)
+    ├── service_provider/              # Provider implementations (Spring @Component)
+    └── adapter/                       # Adapters (repo model <-> core model)
+```
+
+## 2. Naming Conventions
+
+| Artifact             | Suffix                | Annotation             | Package                         |
+| -------------------- | --------------------- | ---------------------- | ------------------------------- |
+| Use case class       | `UseCase`             | `@UseCase`             | `core.<domain>.use_case`        |
+| Domain service class | `DomainService`       | `@DomainService`       | `core.<domain>.domain_service`  |
+| Repository interface | `Repository`          | —                      | `core.<domain>.port.repository` |
+| Repository impl      | `MongoRepository`     | `@Repository`          | `infra.repository.<domain>`     |
+| Domain exception     | context-specific name | extends base exception | `core.<domain>.exception`       |
+| Adapter              | `Adapter`             | —                      | `infra.adapter`                 |
+
+## 3. Use Case Rules
+
+- Annotate with `@UseCase` (annotation from gravitee-apim-common — provides `@Transactional`).
+- **One use case = one user/system action.**
+- IMPORTANT: Use cases **CANNOT** depend on other use cases.
+- Allowed dependencies: `Repository`, `DomainService`, `ServiceProvider` only.
+- Define `Input` and `Output` as Java **records** (inner classes of the use case).
+- Single `public Output execute(Input input)` method.
+- Constructor injection (explicit or `@RequiredArgsConstructor`).
+
+Example:
+
+```java
+@UseCase
+@RequiredArgsConstructor
+public class GetClusterUseCase {
+
+    private final ClusterRepository clusterRepository;
+
+    public record Input(String clusterId, String environmentId) {}
+    public record Output(Cluster cluster) {}
+
+    public Output execute(Input input) {
+        var cluster = clusterRepository.get(input.clusterId());
+        return new Output(cluster);
+    }
+}
+```
+
+## 4. Domain Service Rules
+
+- Annotate with `@DomainService` (annotation from gravitee-apim-common).
+- Contains reusable business logic shared across multiple use cases.
+- **Framework-agnostic** — no Spring dependencies, no dependencies to infra packages.
+- Can be called by use cases and other domain services.
+- A DomainService is a class not an interface. If it needs to use a Legacy service, it should call a LegacyService wrapper from the port package.
+
+## 5. Core Layer Independence
+
+The `core` package must **not** depend on Spring, infrastructure, or external framework libraries.
+
+Allowed dependencies:
+
+- `java.*`, `jakarta.*`
+- `lombok.*`
+- `com.fasterxml.*` (Jackson)
+- `org.slf4j.*`
+- `io.gravitee.definition.*`, `io.gravitee.common.*`
+
+Only exception: `@UseCase` uses `@Transactional` (accepted trade-off).
+
+**The core layer does not log.** Two guardrails overlap to forbid both logger annotations here, and neither fires during `mvn test`:
+
+- `@CustomLog` resolves to `io.gravitee.node.logging.NodeLoggerFactory` (see the root `lombok.config`), which is not in the allowlist above — caught by `CoreRulesTest`.
+- `@Slf4j` resolves to `org.slf4j.LoggerFactory`, forbidden repo-wide by the `gravitee-archrules-maven-plugin` `global-logging-check` goal. The allowlist entry `org.slf4j.*` above therefore only covers types like `Logger` passed around, never the factory.
+
+Log from the REST or infra layer instead, with `@CustomLog`. Run `mvn verify -pl <module> -DskipTests` before pushing: the plugin check runs after `test`, so a green `mvn test` proves nothing about it.
+
+## 6. Infrastructure Layer
+
+- Generate adapters to convert between repository models and core domain models (Anticorruption Layer).
+- Adapter pattern: `XxxAdapter.INSTANCE.toCoreModel(...)` / `.toRepository(...)`.
+
+Example with MapStruct (but any other mapper library or in-house implementation works):
+
+```java
+@Mapper
+public interface ClusterAdapter {
+    ClusterAdapter INSTANCE = Mappers.getMapper(ClusterAdapter.class);
+
+    Cluster toCoreModel(io.gravitee.repository.management.model.Cluster source);
+    io.gravitee.repository.management.model.Cluster toRepository(Cluster source);
+}
+```
+
+## 7. Domain Models
+
+- Domain behavior methods are preferred on model classes. We apply OOP principles to domain models. We avoid anemic models.
+- Separate input classes for creation/update: `NewXxxCommand`, `UpdateXxxCommand`.
+
+## 8. Exception Hierarchy
+
+- Use base exceptions from gravitee-apim-common: `NotFoundDomainException`, `ValidationDomainException`, `TechnicalDomainException` in `core.exception`.
+- Domain exceptions extend these bases with descriptive names (e.g., `ClusterNotFoundException`).
+
+## 9. REST Layer Conventions
+
+- JAX-RS: `@Path`, `@GET`/`@POST`/etc., `@Produces(MediaType.APPLICATION_JSON)`.
+- Inject with `@Inject` (Jakarta), not `@Autowired`.
+- **REST resources call use cases** — never repositories directly.
+- Register the parent resource in the module's registration class — `HttpApiManagementModule` (module-apim), `PlatformModule` (module-platform), or `GammaModuleApplication` (the host). Each sub-resource should be referenced in that parent resource.
+- Use records for simple response DTOs.
+- For resource-creation endpoints, the id comes from the request, not generated by the use case.
+
+## 10. Testing
+
+### Domain Tests
+
+- **Fixtures-first**: every `// Given` goes through fixtures — never direct entity instantiation or raw repository calls. This keeps the in-memory object graph consistent and shields tests from signature refactors.
+- **Fixture tree**: a `RootFixture` exposes sub-fixtures per sub-domain as **public fields** (`rootFixture.apiFixture`, `rootFixture.planFixture`, `rootFixture.subscriptionFixture`, ...). Fields are public and non-final so a test can swap in a specific implementation and rebuild the graph when needed.
+- **One sub-fixture, one responsibility**: each sub-fixture owns its use-cases and in-memory repositories, and exposes `givenXxx(...)` methods that return the persisted entity, ready to feed the `// When`.
+- **Lambda customization**: `givenXxx` methods accept a `UnaryOperator<XxxBuilder>` to override defaults without bloating the API surface. Defaults must produce a valid entity with no argument.
+
+    ```java
+    public class ApiFixture {
+        public final CreateApiUseCase createApiUseCase;
+        public final ApiCrudServiceInMemory apiCrudService;
+
+        public Api givenAnApi() {
+            return givenAnApi(builder -> builder);
+        }
+
+        public Api givenAnApi(UnaryOperator<Api.ApiBuilder> customizer) {
+            Api.ApiBuilder defaults = Api.builder()
+                .id(UUID.randomUUID().toString())
+                .name("default-api")
+                .version("1.0");
+            return createApiUseCase.execute(customizer.apply(defaults).build());
+        }
+    }
+
+    // Usage in a test
+    var api = rootFixture.apiFixture.givenAnApi(a -> a.name("my-api"));
+    ```
+
+- **Cross-domain scenarios**: a `givenAnApiWithAPlan()` orchestrates multiple sub-domains. Placement rule:
+    - Scenario stays **within one** sub-domain → method on the sub-fixture (`apiFixture.givenAnApiWithMetadata(...)`).
+    - Scenario **crosses** sub-domains → method on `RootFixture` (`rootFixture.givenAnApiWithAPlan()`), delegating to sub-fixtures.
+    - When cross-domain scenarios grow (> ~5 per theme), extract them into dedicated `XxxScenarios` classes (e.g. `SubscriptionScenarios`) wired into `RootFixture` — prevents `RootFixture` from becoming a god-object.
+- **Test structure**: `// Given` / `// When` / `// Then`, snake_case method names, `@DisplayNameGeneration`, no mocks — fixtures provide real instances wired to in-memory repositories.
+
+### Repository Tests
+
+- **Shared contract**: for each repository, define an abstract `XxxRepositoryContractTest` that describes the expected behavior (CRUD, queries, sorting, pagination, edge cases such as missing entity / duplicate / null field). This is the **contract** every implementation must honor.
+- **Dual implementation by default**: each contract is executed by at least two concrete suites — `XxxMongoRepositoryTest extends XxxRepositoryContractTest` (Testcontainers) and `XxxInMemoryRepositoryTest extends XxxRepositoryContractTest`. Domain fixtures rely on the in-memory variant, so any Mongo/in-memory divergence would silently break domain tests — the contract pins that equivalence.
+- **No implementation-specific tests** unless justified (e.g. Mongo indexes): all functional behavior lives in the contract.
+
+### REST tests
+
+- Extend `AbstractResourceTest` for the Jersey test harness.
+
+### Architecture tests (ArchUnit)
+
+- Create ArchUnit tests enforcing:
+    - Naming conventions (suffixes match table in section 2).
+    - Use cases reside in `use_case` packages.
+    - Use cases do not depend on other use cases.
+    - Core layer only depends on allowed packages (section 5).
+    - Enforce the inward dependency direction `rest -> core <- infra`: core depends on neither rest nor infra, rest does not reach into infra, and infra does not reach into rest.

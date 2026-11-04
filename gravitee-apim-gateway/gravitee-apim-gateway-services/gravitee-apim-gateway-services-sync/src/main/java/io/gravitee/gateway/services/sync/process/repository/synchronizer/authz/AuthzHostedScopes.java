@@ -1,0 +1,147 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.synchronizer.authz;
+
+import io.gravitee.common.util.EnvironmentUtils;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Set of named PDP routing scopes ({@code targetPdpId}, or {@code targetPdpId@tag} when tagged) provisioned
+ * on <strong>this node</strong>, grouped by engine ({@code environmentId:targetPdpId}). Populated by
+ * {@link AuthzPdpSynchronizer} on provision / evict, and read by {@link EventBusAuthzEnginePort} so a node
+ * only routes policies/entities to the scopes it actually hosts — instead of blindly routing to every
+ * {@code targetPdpId} a document declares and hitting {@code NO_HANDLERS} on scopes that live on other
+ * nodes.
+ *
+ * <p>The global {@code default} scope (no tag) is always served (the bootstrap engine present on every
+ * node). The {@code *} wildcard is expanded by the engine port and routed per-scope, so each node delivers
+ * a wildcard document to exactly the engines it hosts. Policies and entities expand to
+ * {@link #hostedFor(String)} plus {@code default}; <strong>schema documents expand to
+ * {@link #hostedFor(String)} only</strong>, because the bootstrap engine is shared across environments and
+ * a wildcard schema landing there would merge two environments' contracts into one. Targeting
+ * {@code default} explicitly still reaches it.
+ *
+ * <p>Tag gating mirrors API sharding ({@link io.gravitee.common.util.EnvironmentUtils#hasMatchingTags}):
+ * an untagged gateway is a catch-all that serves every scope, a tagged gateway serves a scope whose tag
+ * it carries (and is not excluded via {@code !tag}). A tag-scoped default ({@code default@<tag>}) needs no
+ * provisioning — the default engine is always present — so it is served from this node's static sharding
+ * tags, not from the provisioned {@link #hostedByBase} index.
+ */
+public class AuthzHostedScopes {
+
+    static final String DEFAULT_SCOPE = "default";
+    static final String WILDCARD = "*";
+    static final String SCOPE_TAG_SEPARATOR = "@";
+
+    // Keyed by "environmentId:base" so serves() stays an O(1) lookup; values are the full routing
+    // scopes (possibly "@tag"-suffixed) the wildcard expansion routes to.
+    private final Map<String, Set<String>> hostedByBase = new ConcurrentHashMap<>();
+    private final Set<String> nodeTags;
+
+    public AuthzHostedScopes() {
+        this(Set.of());
+    }
+
+    public AuthzHostedScopes(Set<String> nodeTags) {
+        this.nodeTags = nodeTags == null ? Set.of() : Set.copyOf(nodeTags);
+    }
+
+    private static String key(String environmentId, String targetPdpId) {
+        return environmentId + ":" + targetPdpId;
+    }
+
+    /** Record a provisioned scope. Pass the full routing scope ("targetPdpId@tag" when tagged) so the
+     *  wildcard expansion can reach tagged engines — "*" means every gateway, tagged and untagged. */
+    public void markHosted(String environmentId, String routingScope) {
+        // compute, not computeIfAbsent + add: unmarkHosted unlinks a drained bucket inside its own
+        // remapping function, so an add outside the lambda could land on the unlinked set and be lost.
+        hostedByBase.compute(key(environmentId, baseOf(routingScope)), (k, scopes) -> {
+            Set<String> hosted = scopes == null ? ConcurrentHashMap.newKeySet() : scopes;
+            hosted.add(routingScope);
+            return hosted;
+        });
+    }
+
+    /** Remove a routing scope and return whether its engine still hosts another routing scope here, as one
+     *  atomic step. */
+    public boolean unmarkHosted(String environmentId, String routingScope) {
+        Set<String> remaining = hostedByBase.computeIfPresent(key(environmentId, baseOf(routingScope)), (k, scopes) -> {
+            scopes.remove(routingScope);
+            return scopes.isEmpty() ? null : scopes;
+        });
+        return remaining != null;
+    }
+
+    /** Whether this exact routing scope is provisioned here. */
+    public boolean isHosted(String environmentId, String routingScope) {
+        return hostedByBase.getOrDefault(key(environmentId, baseOf(routingScope)), Set.of()).contains(routingScope);
+    }
+
+    /** The routing scopes this node hosts on the engine that serves {@code routingScope}, itself included. */
+    public Set<String> hostedOnEngine(String environmentId, String routingScope) {
+        return hostedByBase.getOrDefault(key(environmentId, baseOf(routingScope)), Set.of());
+    }
+
+    /** The routing scopes whose engine is provisioned on this node for the given environment.
+     *  A wildcard ("*") document expands to these (plus the always-on default) so it is routed per-scope to
+     *  exactly the engines this node hosts, rather than via a fire-and-forget broadcast. */
+    public Set<String> hostedFor(String environmentId) {
+        String prefix = environmentId + ":";
+        return hostedByBase
+            .entrySet()
+            .stream()
+            .filter(e -> e.getKey().startsWith(prefix))
+            .flatMap(e -> e.getValue().stream())
+            .collect(Collectors.toSet());
+    }
+
+    /**
+     * Whether a document targeting {@code scope} should be applied on this node. The scope is
+     * "<targetPdpId>@<tag>" when tagged, else the bare targetPdpId. {@code default} and the {@code *}
+     * wildcard are always served; a tagged scope additionally requires this node to carry the tag; a named
+     * scope requires its engine to be provisioned here.
+     */
+    public boolean serves(String environmentId, String scope) {
+        if (WILDCARD.equals(scope)) {
+            return true;
+        }
+        int at = scope.indexOf(SCOPE_TAG_SEPARATOR);
+        String base = at >= 0 ? scope.substring(0, at) : scope;
+        String tag = at >= 0 ? scope.substring(at + SCOPE_TAG_SEPARATOR.length()) : null;
+        // The global default engine (default scope, no tag) is the always-on bootstrap on every node.
+        if (DEFAULT_SCOPE.equals(base) && tag == null) {
+            return true;
+        }
+        // The default engine is always present; a named engine must be provisioned here. The index is
+        // keyed by the bare targetPdpId part — the engine identity is the base, the tag only gates
+        // placement.
+        boolean baseHosted = DEFAULT_SCOPE.equals(base) || hostedByBase.containsKey(key(environmentId, base));
+        // Tag gating mirrors API sharding (EnvironmentUtils#hasMatchingTags): an untagged node is a
+        // catch-all, a tagged node serves a scope whose tag it carries (and is not excluded via "!tag").
+        Set<String> scopeTags = tag == null ? Set.of() : Set.of(tag);
+        return baseHosted && EnvironmentUtils.hasMatchingTags(Optional.of(List.copyOf(nodeTags)), scopeTags);
+    }
+
+    private static String baseOf(String scope) {
+        int at = scope.indexOf(SCOPE_TAG_SEPARATOR);
+        return at >= 0 ? scope.substring(0, at) : scope;
+    }
+}

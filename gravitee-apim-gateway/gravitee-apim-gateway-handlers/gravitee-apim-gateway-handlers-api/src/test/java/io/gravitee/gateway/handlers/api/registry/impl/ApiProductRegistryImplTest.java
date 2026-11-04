@@ -1,0 +1,685 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.handlers.api.registry.impl;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
+
+import io.gravitee.definition.model.v4.plan.Plan;
+import io.gravitee.definition.model.v4.plan.PlanStatus;
+import io.gravitee.gateway.env.GatewayConfiguration;
+import io.gravitee.gateway.handlers.api.ReactableApiProduct;
+import io.gravitee.gateway.handlers.api.registry.ApiProductRegistry;
+import java.util.Collection;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * @author Arpit Mishra (arpit.mishra at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@ExtendWith(MockitoExtension.class)
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+class ApiProductRegistryImplTest {
+
+    @Mock
+    private GatewayConfiguration gatewayConfiguration;
+
+    private ApiProductRegistryImpl registry;
+
+    @BeforeEach
+    void setUp() {
+        lenient().when(gatewayConfiguration.shardingTags()).thenReturn(Optional.of(List.of("internal")));
+        lenient().when(gatewayConfiguration.hasMatchingTags(any())).thenReturn(true);
+        registry = new ApiProductRegistryImpl(gatewayConfiguration);
+    }
+
+    @Nested
+    class RegistrationTest {
+
+        @Test
+        void should_register_api_product() {
+            ReactableApiProduct apiProduct = createApiProduct("product-1", "env-1");
+
+            registry.register(apiProduct);
+
+            ReactableApiProduct retrieved = registry.get("product-1", "env-1");
+            assertThat(retrieved).isNotNull();
+            assertThat(retrieved.getId()).isEqualTo("product-1");
+            assertThat(retrieved.getName()).isEqualTo("Product 1");
+        }
+
+        @Test
+        void should_replace_existing_api_product_on_register() {
+            ReactableApiProduct apiProduct1 = createApiProduct("product-1", "env-1");
+            apiProduct1.setName("Original Name");
+
+            ReactableApiProduct apiProduct2 = createApiProduct("product-1", "env-1");
+            apiProduct2.setName("Updated Name");
+
+            registry.register(apiProduct1);
+            registry.register(apiProduct2);
+
+            ReactableApiProduct retrieved = registry.get("product-1", "env-1");
+            assertThat(retrieved).isNotNull();
+            assertThat(retrieved.getName()).isEqualTo("Updated Name");
+        }
+
+        @Test
+        void should_register_multiple_api_products_in_same_environment() {
+            ReactableApiProduct apiProduct1 = createApiProduct("product-1", "env-1");
+            ReactableApiProduct apiProduct2 = createApiProduct("product-2", "env-1");
+            ReactableApiProduct apiProduct3 = createApiProduct("product-3", "env-1");
+
+            registry.register(apiProduct1);
+            registry.register(apiProduct2);
+            registry.register(apiProduct3);
+
+            assertThat(registry.get("product-1", "env-1")).isNotNull();
+            assertThat(registry.get("product-2", "env-1")).isNotNull();
+            assertThat(registry.get("product-3", "env-1")).isNotNull();
+        }
+
+        @Test
+        void should_register_same_product_in_different_environments() {
+            ReactableApiProduct apiProductEnv1 = createApiProduct("product-1", "env-1");
+            ReactableApiProduct apiProductEnv2 = createApiProduct("product-1", "env-2");
+
+            registry.register(apiProductEnv1);
+            registry.register(apiProductEnv2);
+
+            assertThat(registry.get("product-1", "env-1")).isNotNull();
+            assertThat(registry.get("product-1", "env-2")).isNotNull();
+            assertThat(registry.get("product-1", "env-1")).isNotEqualTo(registry.get("product-1", "env-2"));
+        }
+    }
+
+    @Nested
+    class RetrievalTest {
+
+        @Test
+        void should_return_null_when_api_product_not_found() {
+            ReactableApiProduct retrieved = registry.get("non-existent", "env-1");
+            assertThat(retrieved).isNull();
+        }
+
+        @Test
+        void should_return_null_when_environment_does_not_match() {
+            ReactableApiProduct apiProduct = createApiProduct("product-1", "env-1");
+            registry.register(apiProduct);
+
+            ReactableApiProduct retrieved = registry.get("product-1", "env-2");
+            assertThat(retrieved).isNull();
+        }
+
+        @Test
+        void should_get_all_api_products() {
+            ReactableApiProduct apiProduct1 = createApiProduct("product-1", "env-1");
+            ReactableApiProduct apiProduct2 = createApiProduct("product-2", "env-1");
+            ReactableApiProduct apiProduct3 = createApiProduct("product-3", "env-2");
+
+            registry.register(apiProduct1);
+            registry.register(apiProduct2);
+            registry.register(apiProduct3);
+
+            Collection<ReactableApiProduct> allProducts = registry.getAll();
+            assertThat(allProducts).hasSize(3);
+        }
+
+        @Test
+        void should_return_empty_collection_when_no_products() {
+            Collection<ReactableApiProduct> allProducts = registry.getAll();
+            assertThat(allProducts).isEmpty();
+        }
+    }
+
+    @Nested
+    class RemovalTest {
+
+        @Test
+        void should_remove_api_product() {
+            ReactableApiProduct apiProduct = createApiProduct("product-1", "env-1");
+            registry.register(apiProduct);
+
+            assertThat(registry.get("product-1", "env-1")).isNotNull();
+
+            registry.remove("product-1", "env-1");
+
+            assertThat(registry.get("product-1", "env-1")).isNull();
+        }
+
+        @Test
+        void should_not_fail_when_removing_non_existent_product() {
+            registry.remove("non-existent", "env-1");
+            // Should not throw exception
+        }
+
+        @Test
+        void should_only_remove_product_from_specified_environment() {
+            ReactableApiProduct apiProductEnv1 = createApiProduct("product-1", "env-1");
+            ReactableApiProduct apiProductEnv2 = createApiProduct("product-1", "env-2");
+
+            registry.register(apiProductEnv1);
+            registry.register(apiProductEnv2);
+
+            registry.remove("product-1", "env-1");
+
+            assertThat(registry.get("product-1", "env-1")).isNull();
+            assertThat(registry.get("product-1", "env-2")).isNotNull();
+        }
+
+        @Test
+        void should_remove_all_products_with_clear() {
+            ReactableApiProduct apiProduct1 = createApiProduct("product-1", "env-1");
+            ReactableApiProduct apiProduct2 = createApiProduct("product-2", "env-1");
+
+            registry.register(apiProduct1);
+            registry.register(apiProduct2);
+
+            registry.clear();
+
+            assertThat(registry.getAll()).isEmpty();
+        }
+    }
+
+    @Nested
+    class GetApiProductIdsForApiTest {
+
+        @Test
+        void should_return_empty_when_api_id_null_or_unknown() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            assertThat(registry.getApiProductIdsForApi(null)).isEmpty();
+            assertThat(registry.getApiProductIdsForApi("unknown-api")).isEmpty();
+        }
+
+        @Test
+        void should_return_every_product_containing_the_api_across_environments() {
+            ReactableApiProduct first = createApiProduct("product-1", "env-1");
+            first.setApiIds(Set.of("api-1", "api-2"));
+            first.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            ReactableApiProduct second = createApiProduct("product-2", "env-2");
+            second.setApiIds(Set.of("api-1"));
+            second.setPlans(List.of(createPlan("plan-2", PlanStatus.DEPRECATED)));
+            registry.register(first);
+            registry.register(second);
+
+            // Request-path lookups have no environment: an API ID is globally unique, so both
+            // products are legitimate scopes to probe for a subscription on api-1.
+            assertThat(registry.getApiProductIdsForApi("api-1")).containsExactlyInAnyOrder("product-1", "product-2");
+            assertThat(registry.getApiProductIdsForApi("api-2")).containsExactly("product-1");
+        }
+
+        @Test
+        void should_not_return_a_product_without_any_servable_plan() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.CLOSED)));
+            registry.register(product);
+
+            // No servable plan means no subscription can resolve through this product.
+            assertThat(registry.getApiProductIdsForApi("api-1")).isEmpty();
+        }
+
+        @Test
+        void should_drop_the_api_when_the_product_is_removed() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+            assertThat(registry.getApiProductIdsForApi("api-1")).containsExactly("product-1");
+
+            registry.remove("product-1", "env-1");
+
+            assertThat(registry.getApiProductIdsForApi("api-1")).isEmpty();
+        }
+
+        @Test
+        void should_drop_the_api_when_it_leaves_the_product() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1", "api-2"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            ReactableApiProduct updated = createApiProduct("product-1", "env-1");
+            updated.setApiIds(Set.of("api-1"));
+            updated.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(updated);
+
+            assertThat(registry.getApiProductIdsForApi("api-1")).containsExactly("product-1");
+            assertThat(registry.getApiProductIdsForApi("api-2")).isEmpty();
+        }
+
+        private Plan createPlan(String id, PlanStatus status) {
+            Plan plan = new Plan();
+            plan.setId(id);
+            plan.setName("Plan " + id);
+            plan.setStatus(status);
+            return plan;
+        }
+    }
+
+    @Nested
+    class GetProductPlanEntriesForApiTest {
+
+        @Test
+        void should_return_empty_when_api_id_null() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi(null, "env-1");
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_return_empty_when_environment_id_null() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", null);
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_return_plan_entries_for_api_in_product() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1", "api-2"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).apiProductId()).isEqualTo("product-1");
+            assertThat(entries.get(0).plan().getId()).isEqualTo("plan-1");
+        }
+
+        @Test
+        void should_return_empty_when_product_environment_mismatch() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-2");
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_return_empty_when_product_api_ids_null() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(null);
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_return_empty_when_api_not_in_product() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("other-api"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_return_multiple_entries_when_multiple_plans() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED), createPlan("plan-2", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).hasSize(2);
+        }
+
+        @Test
+        void should_return_empty_when_product_has_null_plans() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(null);
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_include_deprecated_plans_in_entries() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-deprecated", PlanStatus.DEPRECATED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).plan().getId()).isEqualTo("plan-deprecated");
+        }
+
+        @Test
+        void should_exclude_closed_plans_from_entries() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(
+                List.of(
+                    createPlan("plan-published", PlanStatus.PUBLISHED),
+                    createPlan("plan-closed", PlanStatus.CLOSED),
+                    createPlan("plan-staging", PlanStatus.STAGING)
+                )
+            );
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).plan().getId()).isEqualTo("plan-published");
+        }
+
+        private Plan createPlan(String id, PlanStatus status) {
+            Plan plan = new Plan();
+            plan.setId(id);
+            plan.setName("Plan " + id);
+            plan.setStatus(status);
+            return plan;
+        }
+    }
+
+    @Nested
+    class ShardingTagFilteringTest {
+
+        @Test
+        void should_exclude_product_when_product_tags_do_not_match_gateway() {
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("external"))).thenReturn(false);
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("internal"))).thenReturn(true);
+
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setTags(Set.of("external"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+            assertThat(entries).isEmpty();
+        }
+
+        @Test
+        void should_include_product_when_product_tags_match_gateway() {
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("internal"))).thenReturn(true);
+
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setTags(Set.of("internal"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+            assertThat(entries).hasSize(1);
+        }
+
+        @Test
+        void should_exclude_plan_when_plan_tags_do_not_match_gateway() {
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("internal"))).thenReturn(true);
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("external"))).thenReturn(false);
+
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setTags(Set.of("internal"));
+
+            Plan planMatching = createPlan("plan-matching", PlanStatus.PUBLISHED);
+            planMatching.setTags(Set.of("internal"));
+            Plan planNotMatching = createPlan("plan-no-match", PlanStatus.PUBLISHED);
+            planNotMatching.setTags(Set.of("external"));
+
+            product.setPlans(List.of(planMatching, planNotMatching));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).plan().getId()).isEqualTo("plan-matching");
+        }
+
+        @Test
+        void should_include_plan_with_no_tags_when_product_matches() {
+            lenient().when(gatewayConfiguration.hasMatchingTags(Set.of("internal"))).thenReturn(true);
+
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setTags(Set.of("internal"));
+
+            Plan planNoTags = createPlan("plan-no-tags", PlanStatus.PUBLISHED);
+
+            product.setPlans(List.of(planNoTags));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).plan().getId()).isEqualTo("plan-no-tags");
+        }
+
+        @Test
+        void should_handle_multi_product_overlap_for_same_api() {
+            ReactableApiProduct product1 = createApiProduct("product-1", "env-1");
+            product1.setApiIds(Set.of("api-shared"));
+            product1.setPlans(List.of(createPlan("plan-p1", PlanStatus.PUBLISHED)));
+
+            ReactableApiProduct product2 = createApiProduct("product-2", "env-1");
+            product2.setApiIds(Set.of("api-shared"));
+            product2.setPlans(List.of(createPlan("plan-p2", PlanStatus.PUBLISHED)));
+
+            registry.register(product1);
+            registry.register(product2);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-shared", "env-1");
+            assertThat(entries).hasSize(2);
+            assertThat(entries)
+                .extracting(ApiProductRegistry.ApiProductPlanEntry::apiProductId)
+                .containsExactlyInAnyOrder("product-1", "product-2");
+        }
+
+        private Plan createPlan(String id, PlanStatus status) {
+            Plan plan = new Plan();
+            plan.setId(id);
+            plan.setName("Plan " + id);
+            plan.setStatus(status);
+            return plan;
+        }
+    }
+
+    @Nested
+    class ConcurrencyTest {
+
+        @Test
+        void should_keep_published_plan_entries_readable_while_products_are_registered() throws Exception {
+            // Readers walk the published lists while the index is rebuilt. If a rebuild mutated the
+            // lists it had published — instead of replacing them — readers would blow up with a
+            // ConcurrentModificationException or observe a half-updated list.
+            ReactableApiProduct initial = createApiProduct("product-0", "env-1");
+            initial.setApiIds(Set.of("api-1"));
+            initial.setPlans(List.of(createPlan("plan-0", PlanStatus.PUBLISHED)));
+            registry.register(initial);
+
+            // A wide product — the longer the published list, the longer a reader spends walking it
+            // while the writer rebuilds, which is the window this guards.
+            ReactableApiProduct wide = createApiProduct("product-wide", "env-1");
+            wide.setApiIds(Set.of("api-1"));
+            wide.setPlans(
+                IntStream.range(0, 200)
+                    .mapToObj(i -> createPlan("wide-plan-" + i, PlanStatus.PUBLISHED))
+                    .toList()
+            );
+            registry.register(wide);
+
+            AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+            AtomicBoolean writingDone = new AtomicBoolean(false);
+            int readerCount = 4;
+            List<Thread> readers = IntStream.range(0, readerCount)
+                .mapToObj(r ->
+                    new Thread(() -> {
+                        try {
+                            while (!writingDone.get()) {
+                                for (ApiProductRegistry.ApiProductPlanEntry entry : registry.getApiProductPlanEntriesForApi(
+                                    "api-1",
+                                    "env-1"
+                                )) {
+                                    assertThat(entry.apiProductId()).isNotNull();
+                                }
+                                assertThat(registry.getApiProductIdsForApi("api-1")).isNotNull();
+                            }
+                        } catch (Throwable t) {
+                            readerFailure.compareAndSet(null, t);
+                        }
+                    })
+                )
+                .toList();
+
+            Thread writer = new Thread(() -> {
+                for (int i = 1; i <= 2_000; i++) {
+                    ReactableApiProduct product = createApiProduct("product-" + i, "env-1");
+                    product.setApiIds(Set.of("api-1"));
+                    product.setPlans(List.of(createPlan("plan-" + i, PlanStatus.PUBLISHED)));
+                    registry.register(product);
+                    registry.remove("product-" + i, "env-1");
+                }
+                writingDone.set(true);
+            });
+
+            readers.forEach(Thread::start);
+            writer.start();
+            writer.join(30_000);
+            for (Thread reader : readers) {
+                reader.join(30_000);
+            }
+
+            assertThat(readerFailure.get()).isNull();
+        }
+
+        @Test
+        void should_publish_immutable_plan_entries() {
+            ReactableApiProduct product = createApiProduct("product-1", "env-1");
+            product.setApiIds(Set.of("api-1"));
+            product.setPlans(List.of(createPlan("plan-1", PlanStatus.PUBLISHED)));
+            registry.register(product);
+
+            List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+
+            assertThat(entries).hasSize(1);
+            assertThatThrownBy(entries::clear).isInstanceOf(UnsupportedOperationException.class);
+        }
+
+        @Test
+        void should_handle_concurrent_registrations() throws InterruptedException {
+            Thread thread1 = new Thread(() -> {
+                for (int i = 0; i < 100; i++) {
+                    registry.register(createApiProduct("product-" + i, "env-1"));
+                }
+            });
+
+            Thread thread2 = new Thread(() -> {
+                for (int i = 100; i < 200; i++) {
+                    registry.register(createApiProduct("product-" + i, "env-1"));
+                }
+            });
+
+            thread1.start();
+            thread2.start();
+            thread1.join();
+            thread2.join();
+
+            assertThat(registry.getAll()).hasSize(200);
+        }
+
+        @Test
+        void should_handle_concurrent_reads_during_rebuild() throws InterruptedException {
+            for (int i = 0; i < 10; i++) {
+                ReactableApiProduct product = createApiProduct("product-" + i, "env-1");
+                product.setPlans(List.of(createPlan("plan-" + i, PlanStatus.PUBLISHED)));
+                registry.register(product);
+            }
+
+            Thread reader = new Thread(() -> {
+                for (int i = 0; i < 1000; i++) {
+                    List<ApiProductRegistry.ApiProductPlanEntry> entries = registry.getApiProductPlanEntriesForApi("api-1", "env-1");
+                    assertThat(entries).isNotNull();
+                }
+            });
+
+            Thread writer = new Thread(() -> {
+                for (int i = 10; i < 20; i++) {
+                    ReactableApiProduct product = createApiProduct("product-" + i, "env-1");
+                    product.setPlans(List.of(createPlan("plan-" + i, PlanStatus.PUBLISHED)));
+                    registry.register(product);
+                }
+            });
+
+            reader.start();
+            writer.start();
+            reader.join();
+            writer.join();
+
+            assertThat(registry.getAll()).hasSize(20);
+        }
+
+        private Plan createPlan(String id, PlanStatus status) {
+            Plan plan = new Plan();
+            plan.setId(id);
+            plan.setName("Plan " + id);
+            plan.setStatus(status);
+            return plan;
+        }
+    }
+
+    private ReactableApiProduct createApiProduct(String id, String environmentId) {
+        return ReactableApiProduct.builder()
+            .id(id)
+            .name("Product " + id.substring(id.lastIndexOf('-') + 1))
+            .version("1.0")
+            .apiIds(Set.of("api-1"))
+            .environmentId(environmentId)
+            .environmentHrid("env-hrid")
+            .organizationId("org-1")
+            .organizationHrid("org-hrid")
+            .deployedAt(new Date())
+            .build();
+    }
+}

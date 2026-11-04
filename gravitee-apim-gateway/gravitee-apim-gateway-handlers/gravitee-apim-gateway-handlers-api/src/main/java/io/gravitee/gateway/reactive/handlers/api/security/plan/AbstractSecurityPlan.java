@@ -1,0 +1,193 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.security.plan;
+
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_API;
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_APPLICATION;
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_PLAN;
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_SUBSCRIPTION_ID;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_SECURITY_DIAGNOSTIC;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_SECURITY_TOKEN;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_SUBSCRIPTION;
+import static io.gravitee.gateway.reactive.api.context.InternalContextAttributes.ATTR_INTERNAL_VALIDATE_SUBSCRIPTION;
+
+import io.gravitee.gateway.api.service.Subscription;
+import io.gravitee.gateway.api.service.SubscriptionService;
+import io.gravitee.gateway.reactive.api.ComponentType;
+import io.gravitee.gateway.reactive.api.ExecutionPhase;
+import io.gravitee.gateway.reactive.api.context.base.BaseExecutionContext;
+import io.gravitee.gateway.reactive.api.policy.SecurityToken;
+import io.gravitee.gateway.reactive.api.policy.base.BaseSecurityPolicy;
+import io.gravitee.gateway.reactive.core.context.ComponentScope;
+import io.gravitee.gateway.reactive.handlers.api.security.SecurityChainDiagnostic;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Maybe;
+import io.reactivex.rxjava3.core.Single;
+import jakarta.annotation.Nonnull;
+import java.util.Date;
+import java.util.Optional;
+import lombok.CustomLog;
+
+/**
+ * {@link AbstractSecurityPlan} allows to wrap a {@link BaseSecurityPolicy} and make it working in a security chain.
+ * Security plan is responsible to
+ * <ul>
+ *     <li>Check if a policy can handle the security or not</li>
+ *     <li>Check the eventual selection rule matches (useful when dealing with multiple plans relying on the same security scheme such as <code>Authorization: bearer xxx</code> for JWT and OAuth)</li>
+ *     <li>Check if the policy requires to validate there is an associated subscription or not and validate the subscription accordingly</li>
+ *     <li>Invoke the <code>onSubscriptionInvalid</code> method when necessary</li>
+ * </ul>
+ *
+ * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+public abstract class AbstractSecurityPlan<T extends BaseSecurityPolicy, C extends BaseExecutionContext> {
+
+    protected static final Maybe<Boolean> TRUE = Maybe.just(true);
+    protected static final Maybe<Boolean> FALSE = Maybe.just(false);
+    protected final T policy;
+    private final SecurityPlanContext planContext;
+
+    public AbstractSecurityPlan(@Nonnull final SecurityPlanContext planContext, @Nonnull final T policy) {
+        this.planContext = planContext;
+        this.policy = policy;
+    }
+
+    public String id() {
+        return policy.id();
+    }
+
+    /**
+     * Make sure the security plan can be executed for the current request.
+     *
+     * @param ctx the current execution context.
+     * @return <code>true</code> if this security plan can be executed for the request, <code>false</code> otherwise.
+     */
+    public Single<Boolean> canExecute(C ctx) {
+        SecurityChainDiagnostic securityChainDiagnostic = ctx.getInternalAttribute(ATTR_INTERNAL_SECURITY_DIAGNOSTIC);
+        return extractSecurityToken(ctx)
+            .flatMap(securityToken -> {
+                ctx.setInternalAttribute(ATTR_INTERNAL_SECURITY_TOKEN, securityToken);
+                if (!securityToken.isInvalid()) {
+                    return isApplicableWithValidSubscription(ctx, securityToken);
+                }
+                securityChainDiagnostic.markPlanHasInvalidToken(this.planContext.planName());
+                return Maybe.just(false);
+            })
+            .switchIfEmpty(
+                Single.defer(() -> {
+                    securityChainDiagnostic.markPlanHasNoToken(this.planContext.planName());
+                    return Single.just(false);
+                })
+            );
+    }
+
+    /**
+     * Invokes the policy's method for security.
+     *
+     * @param ctx the current execution context.
+     * @return a {@link Completable} that completes when the security policy has been successfully executed or returns an error otherwise.
+     */
+    public Completable execute(final C ctx, final ExecutionPhase executionPhase) {
+        return executeSecurityPolicy(ctx, executionPhase)
+            .doOnSubscribe(disposable -> {
+                ComponentScope.push(ctx, ComponentType.POLICY, policy.id());
+                ctx.setAttribute(ATTR_PLAN, planContext.planId());
+            })
+            .doFinally(() -> ComponentScope.remove(ctx, ComponentType.POLICY, policy.id()));
+    }
+
+    public int order() {
+        return policy.order();
+    }
+
+    protected abstract Maybe<SecurityToken> extractSecurityToken(final C executionContext);
+
+    protected abstract Completable executeSecurityPolicy(final C ctx, final ExecutionPhase executionPhase);
+
+    protected abstract String getSelectionRule(String selectionRule);
+
+    private Maybe<Boolean> isApplicableWithValidSubscription(BaseExecutionContext ctx, SecurityToken securityToken) {
+        SecurityChainDiagnostic securityChainDiagnostic = ctx.getInternalAttribute(ATTR_INTERNAL_SECURITY_DIAGNOSTIC);
+        String selectionRule = getSelectionRule(planContext.selectionRule());
+        if (selectionRule == null || selectionRule.isEmpty()) {
+            return Maybe.just(validateSubscription(ctx, securityToken));
+        }
+
+        return ctx
+            .getTemplateEngine()
+            .eval(selectionRule, Boolean.class)
+            .map(matches -> {
+                if (Boolean.TRUE.equals(matches)) {
+                    return validateSubscription(ctx, securityToken);
+                }
+
+                securityChainDiagnostic.markPlanHasNoMachingRule(planContext.planName());
+                // Remove any security token as the selection rule don't match
+                ctx.removeInternalAttribute(ATTR_INTERNAL_SECURITY_TOKEN);
+                return false;
+            });
+    }
+
+    private boolean validateSubscription(BaseExecutionContext ctx, SecurityToken securityToken) {
+        SecurityChainDiagnostic securityChainDiagnostic = ctx.getInternalAttribute(ATTR_INTERNAL_SECURITY_DIAGNOSTIC);
+        Boolean validateSubscriptionEnabled = ctx.getInternalAttribute(ATTR_INTERNAL_VALIDATE_SUBSCRIPTION);
+
+        // Skip validating the subscription
+        if (validateSubscriptionEnabled != null && !validateSubscriptionEnabled) {
+            return true;
+        }
+
+        if (!policy.requireSubscription(ctx)) {
+            return true;
+        }
+
+        try {
+            SubscriptionService subscriptionService = ctx.getComponent(SubscriptionService.class);
+            String api = ctx.getAttribute(ATTR_API);
+
+            Optional<Subscription> subscriptionOpt = subscriptionService.getByApiAndSecurityToken(api, securityToken, planContext.planId());
+
+            if (subscriptionOpt.isPresent()) {
+                Subscription subscription = subscriptionOpt.get();
+
+                if (planContext.planId().equals(subscription.getPlan()) && subscription.isTimeValid(ctx.timestamp())) {
+                    ctx.setAttribute(ATTR_APPLICATION, subscription.getApplication());
+                    ctx.setAttribute(ATTR_SUBSCRIPTION_ID, subscription.getId());
+                    ctx.setInternalAttribute(ATTR_INTERNAL_SUBSCRIPTION, subscription);
+                    return true;
+                }
+                Date startingAt = subscription.getStartingAt();
+                if (startingAt != null && startingAt.after(new Date(ctx.timestamp()))) {
+                    securityChainDiagnostic.markPlanHasNotYetStartedSubscription(planContext.planName(), subscription.getApplicationName());
+                } else {
+                    securityChainDiagnostic.markPlanHasExpiredSubscription(planContext.planName(), subscription.getApplicationName());
+                }
+            } else {
+                securityChainDiagnostic.markPlanHasNoSubscription(
+                    planContext.planName(),
+                    securityToken.getTokenType(),
+                    securityToken.getTokenValue()
+                );
+            }
+            return false;
+        } catch (Exception t) {
+            ctx.withLogger(log).warn("An error occurred during subscription validation", t);
+            return false;
+        }
+    }
+}

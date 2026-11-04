@@ -1,0 +1,30 @@
+{
+  "mappings": [
+    {
+      "request": {
+        "method": "GET",
+        "urlPattern": "/hello.*"
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "hello.json.hbs",
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "urlPattern": "/hello.*"
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "hello.json.hbs",
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    }
+  ]
+}

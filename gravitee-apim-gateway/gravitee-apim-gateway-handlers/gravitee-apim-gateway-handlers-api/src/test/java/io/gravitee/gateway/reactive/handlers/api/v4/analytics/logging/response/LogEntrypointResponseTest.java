@@ -1,0 +1,303 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.handlers.api.v4.analytics.logging.response;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.gravitee.common.http.HttpStatusCode;
+import io.gravitee.definition.model.v4.ApiType;
+import io.gravitee.gateway.api.buffer.Buffer;
+import io.gravitee.gateway.api.http.HttpHeaderNames;
+import io.gravitee.gateway.api.http.HttpHeaders;
+import io.gravitee.gateway.http.vertx.VertxHttpHeaders;
+import io.gravitee.gateway.reactive.api.ExecutionFailure;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.api.tracing.Tracer;
+import io.gravitee.gateway.reactive.core.context.HttpExecutionContextInternal;
+import io.gravitee.gateway.reactive.core.context.HttpResponseInternal;
+import io.gravitee.gateway.reactive.core.v4.analytics.LoggingContext;
+import io.gravitee.reporter.api.v4.metric.Metrics;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.subscribers.TestSubscriber;
+import io.vertx.core.http.impl.headers.HeadersMultiMap;
+import java.util.List;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * @author Jeoffrey HAEYAERT (jeoffrey.haeyaert at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@ExtendWith(MockitoExtension.class)
+class LogEntrypointResponseTest {
+
+    protected static final String BODY_CONTENT = "Body content";
+
+    @Mock
+    protected LoggingContext loggingContext;
+
+    @Mock
+    protected HttpResponseInternal response;
+
+    @Mock
+    protected HttpExecutionContextInternal ctx;
+
+    @Captor
+    ArgumentCaptor<Flowable<Buffer>> chunksCaptor;
+
+    @BeforeEach
+    void setUp() {
+        lenient().when(ctx.metrics()).thenReturn(Metrics.builder().apiType(ApiType.PROXY.getLabel()).build());
+    }
+
+    @Test
+    void should_refresh_status_and_headers_once_chunks_are_consumed_for_message_api() {
+        final HttpHeaders headers = HttpHeaders.create();
+        final int[] status = { HttpStatusCode.OK_200 };
+        when(ctx.metrics()).thenReturn(Metrics.builder().apiType(ApiType.MESSAGE.getLabel()).build());
+        when(response.status()).thenAnswer(i -> status[0]);
+        when(response.headers()).thenReturn(headers);
+        when(response.chunks()).thenReturn(
+            Flowable.defer(() -> {
+                status[0] = HttpStatusCode.ACCEPTED_202;
+                headers.set("X-Late", "late");
+                return Flowable.empty();
+            })
+        );
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(true);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getStatus()).isEqualTo(HttpStatusCode.OK_200);
+        verify(response).chunks(chunksCaptor.capture());
+        chunksCaptor.getValue().test().assertComplete();
+
+        assertThat(logResponse.getStatus()).isEqualTo(HttpStatusCode.ACCEPTED_202);
+        assertThat(logResponse.getHeaders().get("X-Late")).isEqualTo("late");
+    }
+
+    @Test
+    void should_log_status_only() {
+        when(response.status()).thenReturn(HttpStatusCode.OK_200);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getStatus()).isEqualTo(HttpStatusCode.OK_200);
+        assertNull(logResponse.getHeaders());
+        assertNull(logResponse.getBody());
+    }
+
+    @Test
+    void should_log_headers() {
+        final HttpHeaders headers = new VertxHttpHeaders(HeadersMultiMap.httpHeaders());
+
+        headers.set("X-Test1", "Value1");
+        headers.set("X-Test2", "Value2");
+        headers.set("X-Test3", List.of("Value3-a", "Value3-b"));
+
+        when(response.headers()).thenReturn(headers);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(true);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertNotSame(headers, logResponse.getHeaders());
+        assertThat(logResponse.getHeaders().deeplyEquals(headers)).isTrue();
+        assertNull(logResponse.getBody());
+    }
+
+    @Test
+    void should_log_body() {
+        final Flowable<Buffer> body = Flowable.just(Buffer.buffer(BODY_CONTENT));
+
+        when(response.chunks()).thenReturn(body);
+        when(response.headers()).thenReturn(HttpHeaders.create());
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(true);
+        when(loggingContext.getMaxSizeLogMessage()).thenReturn(-1);
+        when(loggingContext.isBodyLoggable()).thenReturn(true);
+        when(loggingContext.isContentTypeLoggable(any(), any())).thenReturn(true);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+        verify(response).chunks(chunksCaptor.capture());
+
+        final TestSubscriber<Buffer> obs = chunksCaptor.getValue().test();
+        obs.assertComplete();
+
+        assertNull(logResponse.getHeaders());
+        assertThat(logResponse.getBody()).isEqualTo(BODY_CONTENT);
+    }
+
+    @Test
+    void should_not_log_body_when_content_type_excluded() {
+        final HttpHeaders headers = HttpHeaders.create();
+        headers.set(HttpHeaderNames.CONTENT_TYPE, "application/octet-stream");
+
+        when(response.headers()).thenReturn(headers);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(true);
+        when(loggingContext.isContentTypeLoggable(eq("application/octet-stream"), any())).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+        verify(response, times(0)).chunks(any(Flowable.class));
+
+        assertNull(logResponse.getHeaders());
+        assertNull(logResponse.getBody());
+    }
+
+    @Test
+    void should_log_partial_body_when_max_payload_size_is_defined() {
+        final Flowable<Buffer> body = Flowable.just(Buffer.buffer(BODY_CONTENT));
+        final int maxPayloadSize = 5;
+
+        when(response.chunks()).thenReturn(body);
+        when(response.headers()).thenReturn(HttpHeaders.create());
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(true);
+        when(loggingContext.getMaxSizeLogMessage()).thenReturn(maxPayloadSize);
+        when(loggingContext.isBodyLoggable()).thenReturn(true);
+        when(loggingContext.isContentTypeLoggable(any(), any())).thenReturn(true);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+        verify(response).chunks(chunksCaptor.capture());
+
+        final TestSubscriber<Buffer> obs = chunksCaptor.getValue().test();
+        obs.assertComplete();
+
+        assertNull(logResponse.getHeaders());
+        assertThat(logResponse.getBody()).isEqualTo(BODY_CONTENT.substring(0, maxPayloadSize));
+    }
+
+    @Test
+    void should_use_failure_status_when_execution_failure_is_present() {
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+        when(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_FAILURE)).thenReturn(new ExecutionFailure(400));
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getStatus()).isEqualTo(400);
+        assertNull(logResponse.getBody());
+    }
+
+    @Test
+    void should_set_failure_message_as_body_when_payload_logging_enabled_and_no_body_captured() {
+        final String errorMessage = "{\"message\":\"validation failed\"}";
+        when(response.headers()).thenReturn(HttpHeaders.create());
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(true);
+        when(loggingContext.isBodyLoggable()).thenReturn(true);
+        when(loggingContext.isContentTypeLoggable(any(), any())).thenReturn(false);
+        when(ctx.getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_FAILURE)).thenReturn(
+            new ExecutionFailure(400).message(errorMessage)
+        );
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getStatus()).isEqualTo(400);
+        assertThat(logResponse.getBody()).isEqualTo(errorMessage);
+    }
+
+    @Test
+    void should_capture_traceId_and_spanId_from_tracer() {
+        var mockTracer = mock(Tracer.class);
+        when(mockTracer.traceId()).thenReturn("abc123traceId00000000000000000000");
+        when(mockTracer.spanId()).thenReturn("def456spanId0000");
+        when(ctx.getTracer()).thenReturn(mockTracer);
+        when(response.status()).thenReturn(200);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getTraceId()).isEqualTo("abc123traceId00000000000000000000");
+        assertThat(logResponse.getSpanId()).isEqualTo("def456spanId0000");
+    }
+
+    @Test
+    void should_set_null_traceId_and_spanId_when_tracer_is_null() {
+        when(ctx.getTracer()).thenReturn(null);
+        when(response.status()).thenReturn(200);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertNull(logResponse.getTraceId());
+        assertNull(logResponse.getSpanId());
+    }
+
+    @Test
+    void should_log_body_not_captured_when_body_is_not_loggable() {
+        when(response.headers()).thenReturn(HttpHeaders.create());
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(true);
+        when(loggingContext.isBodyLoggable()).thenReturn(false);
+        when(loggingContext.isContentTypeLoggable(any(), any())).thenReturn(true);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+        verify(response, never()).chunks(any(Flowable.class));
+
+        assertNull(logResponse.getHeaders());
+        assertThat(logResponse.getBody()).isEqualTo("BODY NOT CAPTURED");
+    }
+
+    @Test
+    void should_capture_traceId_even_when_otelLogs_disabled() {
+        var mockTracer = mock(Tracer.class);
+        when(mockTracer.traceId()).thenReturn("abc123traceId00000000000000000000");
+        when(mockTracer.spanId()).thenReturn("def456spanId0000");
+        when(ctx.getTracer()).thenReturn(mockTracer);
+        when(response.status()).thenReturn(200);
+        when(loggingContext.entrypointResponseHeaders()).thenReturn(false);
+        when(loggingContext.entrypointResponsePayload()).thenReturn(false);
+
+        final var logResponse = new LogEntrypointResponse(loggingContext, response);
+        logResponse.capture(ctx);
+
+        assertThat(logResponse.getTraceId()).isEqualTo("abc123traceId00000000000000000000");
+        assertThat(logResponse.getSpanId()).isEqualTo("def456spanId0000");
+    }
+}

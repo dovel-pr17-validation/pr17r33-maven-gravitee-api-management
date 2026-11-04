@@ -1,0 +1,273 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.mapper;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.gravitee.definition.jackson.datatype.GraviteeMapper;
+import io.gravitee.gateway.api.service.SubscriptionConfiguration;
+import io.gravitee.gateway.handlers.api.ReactableApiProduct;
+import io.gravitee.gateway.handlers.api.registry.ApiProductRegistry;
+import io.gravitee.gateway.services.sync.process.common.mapper.SubscriptionMapper;
+import io.gravitee.repository.management.model.Subscription;
+import io.gravitee.repository.management.model.SubscriptionReferenceType;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Test;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+class SubscriptionMapperTest {
+
+    private final ObjectMapper objectMapper = new GraviteeMapper();
+    private SubscriptionMapper cut;
+    private io.gravitee.repository.management.model.Subscription subscription;
+
+    @BeforeEach
+    public void beforeEach() throws JsonProcessingException {
+        cut = new SubscriptionMapper(objectMapper, mock(ApiProductRegistry.class));
+
+        subscription = new Subscription();
+        subscription.setApi("api");
+        subscription.setReferenceType(SubscriptionReferenceType.API);
+        subscription.setReferenceId("api");
+        subscription.setApplication("application");
+        subscription.setClientId("clientId");
+        subscription.setClientCertificate("clientCertificate");
+        subscription.setStartingAt(new Date());
+        subscription.setEndingAt(new Date());
+        subscription.setId("id");
+        subscription.setPlan("plan");
+        subscription.setStatus(Subscription.Status.ACCEPTED);
+        subscription.setConsumerStatus(Subscription.ConsumerStatus.STARTED);
+        subscription.setType(Subscription.Type.PUSH);
+        subscription.setConfiguration(objectMapper.writeValueAsString(new SubscriptionConfiguration()));
+        subscription.setMetadata(Map.of());
+    }
+
+    @Test
+    void should_map_subscription() throws JsonProcessingException {
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+        assertThat(mapped).hasSize(1);
+        io.gravitee.gateway.api.service.Subscription subscriptionMapped = mapped.getFirst();
+
+        assertThat(subscriptionMapped.getId()).isEqualTo(subscription.getId());
+        assertThat(subscriptionMapped.getApplication()).isEqualTo(subscription.getApplication());
+        assertThat(subscriptionMapped.getClientId()).isEqualTo(subscription.getClientId());
+        assertThat(subscriptionMapped.getClientCertificate()).isEqualTo(subscription.getClientCertificate());
+        assertThat(subscriptionMapped.getStartingAt()).isEqualTo(subscription.getStartingAt());
+        assertThat(subscriptionMapped.getEndingAt()).isEqualTo(subscription.getEndingAt());
+        assertThat(subscriptionMapped.getId()).isEqualTo(subscription.getId());
+        assertThat(subscriptionMapped.getPlan()).isEqualTo(subscription.getPlan());
+        assertThat(subscriptionMapped.getStatus()).isEqualTo(subscription.getStatus().name());
+        assertThat(subscriptionMapped.getConsumerStatus().name()).isEqualTo(subscription.getConsumerStatus().name());
+        assertThat(subscriptionMapped.getType().name()).isEqualTo(subscription.getType().name());
+        assertThat(subscriptionMapped.getConfiguration()).isEqualTo(
+            objectMapper.readValue(subscription.getConfiguration(), SubscriptionConfiguration.class)
+        );
+        assertThat(subscriptionMapped.getMetadata()).isEmpty();
+    }
+
+    @Test
+    void should_map_subscription_without_all_attributes() {
+        subscription.setStatus(null);
+        subscription.setConsumerStatus(null);
+        subscription.setType(null);
+        subscription.setConfiguration(null);
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+        assertThat(mapped).hasSize(1);
+        io.gravitee.gateway.api.service.Subscription subscriptionMapped = mapped.getFirst();
+
+        assertThat(subscriptionMapped.getId()).isEqualTo(subscription.getId());
+        assertThat(subscriptionMapped.getApplication()).isEqualTo(subscription.getApplication());
+        assertThat(subscriptionMapped.getClientId()).isEqualTo(subscription.getClientId());
+        assertThat(subscriptionMapped.getStartingAt()).isEqualTo(subscription.getStartingAt());
+        assertThat(subscriptionMapped.getEndingAt()).isEqualTo(subscription.getEndingAt());
+        assertThat(subscriptionMapped.getId()).isEqualTo(subscription.getId());
+        assertThat(subscriptionMapped.getPlan()).isEqualTo(subscription.getPlan());
+        assertThat(subscriptionMapped.getStatus()).isNull();
+        assertThat(subscriptionMapped.getConsumerStatus()).isEqualTo(io.gravitee.gateway.api.service.Subscription.ConsumerStatus.STARTED);
+        assertThat(subscriptionMapped.getType()).isEqualTo(io.gravitee.gateway.api.service.Subscription.Type.STANDARD);
+        assertThat(subscriptionMapped.getConfiguration()).isNull();
+        assertThat(subscriptionMapped.getMetadata()).isEmpty();
+    }
+
+    @Test
+    void should_share_the_empty_metadata_singleton_across_subscriptions() {
+        subscription.setMetadata(null);
+        io.gravitee.gateway.api.service.Subscription first = cut.to(subscription).getFirst();
+
+        subscription.setMetadata(Map.of());
+        io.gravitee.gateway.api.service.Subscription second = cut.to(subscription).getFirst();
+
+        assertThat(first.getMetadata()).isEmpty();
+        assertThat(first.getMetadata()).isSameAs(second.getMetadata());
+    }
+
+    @Test
+    void should_keep_metadata_entries_with_null_values() {
+        Map<String, String> metadata = new HashMap<>();
+        metadata.put("key", null);
+        subscription.setMetadata(metadata);
+
+        io.gravitee.gateway.api.service.Subscription mapped = cut.to(subscription).getFirst();
+
+        assertThat(mapped.getMetadata()).containsEntry("key", null);
+    }
+
+    @Test
+    void should_intern_repeated_field_values_across_subscriptions() {
+        // new String(...) guarantees distinct input instances (literals are JVM-interned)
+        Subscription other = new Subscription();
+        other.setId("other-id");
+        other.setReferenceType(SubscriptionReferenceType.API);
+        other.setReferenceId(new String("api"));
+        other.setApplication(new String("application"));
+        other.setApplicationName(new String("application-name"));
+        other.setPlan(new String("plan"));
+        other.setEnvironmentId(new String("env"));
+        other.setStatus(Subscription.Status.ACCEPTED);
+        subscription.setApplicationName("application-name");
+        subscription.setEnvironmentId("env");
+
+        io.gravitee.gateway.api.service.Subscription first = cut.to(subscription).getFirst();
+        io.gravitee.gateway.api.service.Subscription second = cut.to(other).getFirst();
+
+        assertThat(second.getApi()).isSameAs(first.getApi());
+        assertThat(second.getApplication()).isSameAs(first.getApplication());
+        assertThat(second.getApplicationName()).isSameAs(first.getApplicationName());
+        assertThat(second.getPlan()).isSameAs(first.getPlan());
+        assertThat(second.getEnvironmentId()).isSameAs(first.getEnvironmentId());
+        // unique-per-subscription fields are not interned
+        assertThat(second.getId()).isEqualTo("other-id");
+    }
+
+    @Test
+    void should_return_empty_list_when_api_product_not_in_registry() {
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId("product-1");
+        subscription.setApi(null);
+        subscription.setEnvironmentId("env-1");
+        ApiProductRegistry registry = mock(ApiProductRegistry.class);
+        when(registry.get("product-1", "env-1")).thenReturn(null);
+        cut = new SubscriptionMapper(objectMapper, registry);
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).isEmpty();
+    }
+
+    @Test
+    void should_map_api_product_subscription_to_a_single_product_scoped_subscription() {
+        // Whatever the size of the product, one repository record yields one runtime subscription:
+        // the runtime caches it under the product and resolves API to product at lookup time.
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId("product-1");
+        subscription.setApi(null);
+        subscription.setEnvironmentId("env-1");
+        ApiProductRegistry registry = mock(ApiProductRegistry.class);
+        ReactableApiProduct product = ReactableApiProduct.builder().id("product-1").apiIds(Set.of("api1", "api2")).build();
+        when(registry.get("product-1", "env-1")).thenReturn(product);
+        cut = new SubscriptionMapper(objectMapper, registry);
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).hasSize(1);
+        assertThat(mapped.getFirst().getApi()).isNull();
+        assertThat(mapped.getFirst().getApiProductId()).isEqualTo("product-1");
+        assertThat(mapped.getFirst().getId()).isEqualTo("id");
+    }
+
+    @Test
+    void should_return_empty_list_when_api_product_subscription_has_null_reference_id() {
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId(null);
+        subscription.setEnvironmentId("env-1");
+        cut = new SubscriptionMapper(objectMapper, mock(ApiProductRegistry.class));
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).isEmpty();
+    }
+
+    @Test
+    void should_return_empty_list_when_api_product_subscription_has_null_environment_id() {
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId("product-1");
+        subscription.setEnvironmentId(null);
+        cut = new SubscriptionMapper(objectMapper, mock(ApiProductRegistry.class));
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).isEmpty();
+    }
+
+    @Test
+    void should_return_empty_list_when_api_product_has_empty_api_ids() {
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId("product-1");
+        subscription.setApi(null);
+        subscription.setEnvironmentId("env-1");
+        ApiProductRegistry registry = mock(ApiProductRegistry.class);
+        ReactableApiProduct product = ReactableApiProduct.builder().id("product-1").apiIds(Set.of()).build();
+        when(registry.get("product-1", "env-1")).thenReturn(product);
+        cut = new SubscriptionMapper(objectMapper, registry);
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).isEmpty();
+    }
+
+    @Test
+    void should_return_empty_list_when_api_product_has_null_api_ids() {
+        subscription.setReferenceType(SubscriptionReferenceType.API_PRODUCT);
+        subscription.setReferenceId("product-1");
+        subscription.setApi(null);
+        subscription.setEnvironmentId("env-1");
+        ApiProductRegistry registry = mock(ApiProductRegistry.class);
+        ReactableApiProduct product = ReactableApiProduct.builder().id("product-1").apiIds(null).build();
+        when(registry.get("product-1", "env-1")).thenReturn(product);
+        cut = new SubscriptionMapper(objectMapper, registry);
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).isEmpty();
+    }
+
+    @Test
+    void should_return_empty_list_on_configuration_parse_error() throws JsonProcessingException {
+        subscription.setConfiguration("invalid-json");
+        cut = new SubscriptionMapper(objectMapper, mock(ApiProductRegistry.class));
+
+        List<io.gravitee.gateway.api.service.Subscription> mapped = cut.to(subscription);
+
+        assertThat(mapped).hasSize(1);
+        assertThat(mapped.get(0).getConfiguration()).isNull();
+    }
+}

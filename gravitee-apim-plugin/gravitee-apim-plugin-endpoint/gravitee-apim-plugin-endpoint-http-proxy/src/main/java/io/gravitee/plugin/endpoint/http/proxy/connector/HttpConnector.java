@@ -1,0 +1,850 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.plugin.endpoint.http.proxy.connector;
+
+import static io.gravitee.gateway.api.http.HttpHeaderNames.CONNECTION;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.HOST;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.KEEP_ALIVE;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.PROXY_AUTHENTICATE;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.PROXY_AUTHORIZATION;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.PROXY_CONNECTION;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.TE;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.TRAILER;
+import static io.gravitee.gateway.api.http.HttpHeaderNames.UPGRADE;
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_REQUEST_ENDPOINT;
+import static io.gravitee.gateway.reactive.api.context.ContextAttributes.ATTR_REQUEST_ENDPOINT_OVERRIDE;
+import static io.gravitee.plugin.endpoint.http.proxy.client.UriHelper.URI_QUERY_DELIMITER_CHAR;
+import static io.gravitee.plugin.endpoint.http.proxy.client.UriHelper.URI_QUERY_DELIMITER_CHAR_SEQUENCE;
+
+import io.gravitee.common.http.HttpHeader;
+import io.gravitee.common.http.HttpHeadersValues;
+import io.gravitee.common.util.LinkedMultiValueMap;
+import io.gravitee.common.util.MultiValueMap;
+import io.gravitee.common.util.URIUtils;
+import io.gravitee.gateway.api.buffer.Buffer;
+import io.gravitee.gateway.api.http.HttpHeaderNames;
+import io.gravitee.gateway.http.vertx.VertxHttpHeaders;
+import io.gravitee.gateway.reactive.api.context.http.HttpExecutionContext;
+import io.gravitee.gateway.reactive.api.context.http.HttpRequest;
+import io.gravitee.gateway.reactive.api.context.http.HttpResponse;
+import io.gravitee.gateway.reactive.http.vertx.VertxHttpServerResponse;
+import io.gravitee.node.api.opentelemetry.Span;
+import io.gravitee.node.api.opentelemetry.http.ObservableHttpClientRequest;
+import io.gravitee.node.api.opentelemetry.http.ObservableHttpClientResponse;
+import io.gravitee.node.vertx.client.http.VertxHttpClientFactory;
+import io.gravitee.plugin.endpoint.http.proxy.client.HttpClientFactory;
+import io.gravitee.plugin.endpoint.http.proxy.client.UriHelper;
+import io.gravitee.plugin.endpoint.http.proxy.configuration.HttpProxyEndpointConnectorConfiguration;
+import io.gravitee.plugin.endpoint.http.proxy.configuration.HttpProxyEndpointConnectorSharedConfiguration;
+import io.gravitee.plugin.endpoint.http.proxy.failure.ConnectionFailureClassifier;
+import io.reactivex.rxjava3.annotations.NonNull;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Single;
+import io.vertx.core.MultiMap;
+import io.vertx.core.http.HttpHeaders;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.HttpVersion;
+import io.vertx.core.http.RequestOptions;
+import io.vertx.core.http.StreamResetException;
+import io.vertx.core.http.impl.headers.HeadersMultiMap;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.rxjava3.core.http.HttpClientRequest;
+import io.vertx.rxjava3.core.http.HttpClientResponse;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import lombok.CustomLog;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+public class HttpConnector implements ProxyConnector {
+
+    /**
+     * Internal-context flag set once a usable upstream connection/stream has been acquired for the current request.
+     * Read by the failure classifier to tell a connection (acquisition) timeout apart from a backend read timeout
+     * without parsing the timeout's message. Absent/false means the request never reached the backend.
+     */
+    public static final String ATTR_INTERNAL_UPSTREAM_CONNECTION_ACQUIRED = "http-proxy.upstream.connection.acquired";
+
+    /**
+     * Headers that are not allowed to be propagated to the endpoint.
+     */
+    static final Set<CharSequence> HOP_HEADERS = Set.of(
+        CONNECTION,
+        KEEP_ALIVE,
+        PROXY_AUTHORIZATION,
+        PROXY_AUTHENTICATE,
+        PROXY_CONNECTION,
+        TE,
+        TRAILER,
+        UPGRADE
+    );
+    /**
+     * How close the upstream silence has to be to the effective idleTimeout before we attribute the closure to the
+     * gateway rather than the backend. A connection cut by the idle timer lands within a few tens of milliseconds of
+     * it; anything looser would start blaming the configuration for genuine backend failures.
+     */
+    private static final long IDLE_TIMEOUT_MATCH_TOLERANCE_MS = 250;
+
+    /**
+     * RFC 9110 section 9.2.2 — "PUT, DELETE, and safe request methods are idempotent". An allowlist rather than a
+     * POST/PATCH denylist: an unrecognised verb resolves to OTHER, which must not be re-sent either.
+     */
+    private static final Set<io.gravitee.common.http.HttpMethod> IDEMPOTENT_METHODS = Set.of(
+        io.gravitee.common.http.HttpMethod.GET,
+        io.gravitee.common.http.HttpMethod.HEAD,
+        io.gravitee.common.http.HttpMethod.OPTIONS,
+        io.gravitee.common.http.HttpMethod.TRACE,
+        io.gravitee.common.http.HttpMethod.PUT,
+        io.gravitee.common.http.HttpMethod.DELETE
+    );
+
+    private final String relativeTarget;
+    protected final String defaultHost;
+    protected final int defaultPort;
+    private final boolean defaultSsl;
+    private final MultiValueMap<String, String> targetParameters;
+    protected final HttpProxyEndpointConnectorConfiguration configuration;
+    protected final HttpProxyEndpointConnectorSharedConfiguration sharedConfiguration;
+    protected final HttpClientFactory httpClientFactory;
+
+    public HttpConnector(
+        final HttpProxyEndpointConnectorConfiguration configuration,
+        final HttpProxyEndpointConnectorSharedConfiguration sharedConfiguration,
+        final HttpClientFactory httpClientFactory
+    ) {
+        this.configuration = configuration;
+        this.sharedConfiguration = sharedConfiguration;
+        this.httpClientFactory = httpClientFactory;
+        final URL targetUrl = VertxHttpClientFactory.buildUrl(configuration.getTarget());
+        this.relativeTarget = targetUrl.getPath();
+        this.defaultHost = targetUrl.getHost();
+        this.defaultPort = targetUrl.getPort() != -1 ? targetUrl.getPort() : targetUrl.getDefaultPort();
+        this.defaultSsl = VertxHttpClientFactory.isSecureProtocol(targetUrl.getProtocol());
+        if (targetUrl.getQuery() == null) {
+            targetParameters = null;
+        } else {
+            targetParameters = URIUtils.parameters(URI_QUERY_DELIMITER_CHAR_SEQUENCE + targetUrl.getQuery());
+        }
+    }
+
+    @Override
+    public Completable connect(final HttpExecutionContext ctx) {
+        try {
+            final HttpRequest request = ctx.request();
+            final HttpResponse response = ctx.response();
+
+            final RequestOptions options = buildRequestOptions(ctx);
+            String absoluteUri = VertxHttpClientFactory.toAbsoluteUri(options, defaultHost, defaultPort);
+            options.setAbsoluteURI(absoluteUri);
+
+            // setAbsoluteURI sets options.host from the endpoint target URL, which Vert.x uses as the
+            // HTTP Host header — overriding any custom Host header configured on the endpoint or HC.
+            // If a custom Host was explicitly set, pin the TCP connection to the actual backend via
+            // setServer() so the custom value only affects the HTTP Host header, not the connection address.
+            final String customHost = options.getHeaders() != null ? options.getHeaders().get(io.vertx.core.http.HttpHeaders.HOST) : null;
+            if (customHost != null && !customHost.isBlank()) {
+                options.setServer(io.vertx.core.net.SocketAddress.inetSocketAddress(options.getPort(), options.getHost()));
+                options.setHost(customHost);
+            }
+
+            ctx.metrics().setEndpoint(absoluteUri);
+            ObservableHttpClientRequest observableHttpClientRequest = new ObservableHttpClientRequest(options);
+            Span httpRequestSpan = ctx.getTracer().startSpanFrom(observableHttpClientRequest);
+            // Tracks the upstream request between pool acquisition and the response head so that disposing the chain
+            // (typically a client abort) releases the pooled connection instead of holding it until the request
+            // timeout fires. From the response head onward, cancellation is handled by the response chunks'
+            // doOnCancel (see getEndpointResponseChunks).
+            final AtomicReference<HttpClientRequest> pendingUpstreamRequest = new AtomicReference<>();
+            final AtomicBoolean cancelled = new AtomicBoolean(false);
+            final Single<HttpClientResponse> endpointExchange = acquireUpstreamRequest(ctx, options, pendingUpstreamRequest, absoluteUri)
+                // The upstream request resolves once a connection/stream is acquired from the pool: from here on, a
+                // request-level timeout is a backend read timeout, not a connection-acquisition timeout (APIM-12769).
+                .doOnSuccess(acquiredRequest -> ctx.setInternalAttribute(ATTR_INTERNAL_UPSTREAM_CONNECTION_ACQUIRED, Boolean.TRUE))
+                .map(this::customizeHttpClientRequest)
+                .flatMap(httpClientRequest -> {
+                    observableHttpClientRequest.httpClientRequest(httpClientRequest.getDelegate());
+                    return sendEndpointRequestChunks(httpClientRequest, request);
+                })
+                .doOnError(throwable -> closeFailedUpstreamConnection(ctx, pendingUpstreamRequest, absoluteUri));
+
+            return retryOnceOnConnectionClosedByPeer(ctx, absoluteUri, request, endpointExchange, cancelled)
+                .doOnSuccess(endpointResponse -> {
+                    // The response chunks' doOnCancel owns cancellation from here; reset() being a no-op on a
+                    // completed stream makes the race with a concurrent disposal benign.
+                    pendingUpstreamRequest.set(null);
+
+                    response.status(endpointResponse.statusCode());
+
+                    copyHeaders(endpointResponse.headers(), response.headers());
+
+                    if (endpointResponse.version() == HttpVersion.HTTP_2) {
+                        endpointResponse.customFrameHandler(frame ->
+                            ((VertxHttpServerResponse) response).getNativeResponse().writeCustomFrame(frame)
+                        );
+                    }
+
+                    // Assign the response chunks from the endpoint's response to the gateway
+                    // response.
+                    response.chunks(getEndpointResponseChunks(ctx, endpointResponse, response, absoluteUri));
+
+                    ObservableHttpClientResponse observableHttpClientResponse = new ObservableHttpClientResponse(
+                        endpointResponse.getDelegate()
+                    );
+                    ctx.getTracer().endWithResponse(httpRequestSpan, observableHttpClientResponse);
+                })
+                .doOnError(throwable -> ctx.getTracer().endOnError(httpRequestSpan, throwable))
+                .ignoreElement()
+                .doOnDispose(() -> {
+                    // Set before the reset below so the retry predicate can tell this self-inflicted stream reset
+                    // (our own cancellation — e.g. a request timeout — tearing down the in-flight request) apart from
+                    // a genuine peer-initiated close/reset; otherwise disposal can race an onError into the still-live
+                    // retry() and send an unwanted extra request on a chain that's already being torn down.
+                    cancelled.set(true);
+                    resetPendingUpstreamRequest(ctx, pendingUpstreamRequest, absoluteUri);
+                });
+        } catch (Exception e) {
+            return Completable.error(e);
+        }
+    }
+
+    /**
+     * Sends the exchange once more, over a connection newly taken from the pool, when the peer tore down the pooled
+     * keep-alive connection before answering (APIM-14873) — whether that surfaces as a clean close or a reset depends
+     * on OS/timing, not on how safe the retry is, so both are treated the same. Such a connection is only discovered
+     * to be dead by writing to it — the backend's keep-alive timeout being shorter than the pool's, or an intermediary
+     * dropping idle connections — and the client is answered with a 502 for a request the backend never handled.
+     * Retrying relies on the pool evicting the connection it just saw fail; the single attempt caps a pool that would
+     * not, degrading to the 502 raised today.
+     * <p>
+     * Two conditions must both hold for the resend. The gateway must not have written a body: once body chunks have
+     * been written they have reached the backend, which may already have acted on them. And the method must be
+     * idempotent (RFC 9110 section 9.2.2 — "PUT, DELETE, and safe request methods are idempotent"): even with no body,
+     * the request head alone may have been received and acted on before the peer tore the connection down, so
+     * re-sending a POST, a PATCH or an unrecognised verb could apply the caller's operation twice. A failure that
+     * fails either condition keeps surfacing as it does today.
+     */
+    private Single<HttpClientResponse> retryOnceOnConnectionClosedByPeer(
+        final HttpExecutionContext ctx,
+        final String absoluteUri,
+        final HttpRequest request,
+        final Single<HttpClientResponse> endpointExchange,
+        final AtomicBoolean cancelled
+    ) {
+        if (sendsRequestBodyBytes(request)) {
+            return endpointExchange;
+        }
+        // The chunks are consumed even though no body is forwarded, to release their resources and update the metrics.
+        // Consuming them here rather than inside the exchange is what makes the exchange safe to subscribe to twice:
+        // the retry never reads the client request again.
+        final Completable requestBodyDrained = request.chunks().ignoreElements();
+        if (!isIdempotentMethod(request)) {
+            return requestBodyDrained.andThen(endpointExchange);
+        }
+        return requestBodyDrained.andThen(
+            endpointExchange.retry((attempt, throwable) -> {
+                if (attempt > 1) {
+                    return false;
+                }
+                if (cancelled.get()) {
+                    return false;
+                }
+                if (!isConnectionClosedOrResetByPeer(throwable)) {
+                    return false;
+                }
+                // Attempt 1's acquired flag must not survive into attempt 2's failure classification (the same
+                // hazard APIM-12769 addressed at the outer retry boundary).
+                ctx.removeInternalAttribute(ATTR_INTERNAL_UPSTREAM_CONNECTION_ACQUIRED);
+                ctx
+                    .withLogger(log)
+                    .warn("Pooled connection to [{}] was closed or reset by the peer, retrying once on a fresh connection", absoluteUri);
+                return true;
+            })
+        );
+    }
+
+    private static boolean isConnectionClosedOrResetByPeer(final Throwable throwable) {
+        final String key = ConnectionFailureClassifier.classify(throwable).key();
+        return ConnectionFailureClassifier.CONNECTION_CLOSED.equals(key) || ConnectionFailureClassifier.CONNECTION_RESET.equals(key);
+    }
+
+    /**
+     * Acquires an upstream request from the client's connection pool, releasing it immediately when the chain has
+     * already been disposed (client abort while the request was queued in the pool). The rx bridge cannot do this by
+     * itself: disposing {@code rxRequest}'s Single only drops the observer, so a connection granted afterwards would
+     * silently hold its pool slot until the request timeout fires — under sustained abort/retry load this keeps the
+     * pool collapsed long after the backend has recovered.
+     */
+    private Single<HttpClientRequest> acquireUpstreamRequest(
+        final HttpExecutionContext ctx,
+        final RequestOptions options,
+        final AtomicReference<HttpClientRequest> pendingUpstreamRequest,
+        final String absoluteUri
+    ) {
+        return Single.create(emitter -> {
+            final var httpClient = httpClientFactory.getOrBuildHttpClient(ctx, configuration, sharedConfiguration).getDelegate();
+            // Taken once the client is in hand: building it on first use — SSL options, keystore loading, under a lock
+            // other requests queue on — is gateway start-up cost, not what the pool and the network contribute.
+            final long connectStartNs = System.nanoTime();
+            httpClient
+                .request(options)
+                .onComplete(asyncRequest -> {
+                    if (asyncRequest.succeeded()) {
+                        recordEndpointConnectTime(ctx, connectStartNs);
+                        final HttpClientRequest upstreamRequest = HttpClientRequest.newInstance(asyncRequest.result());
+                        // Publish the request before checking for disposal so a concurrent disposal either sees it
+                        // (doOnDispose resets it) or is detected right below; getAndSet(null) makes the double reset
+                        // a no-op.
+                        pendingUpstreamRequest.set(upstreamRequest);
+                        if (emitter.isDisposed()) {
+                            resetPendingUpstreamRequest(ctx, pendingUpstreamRequest, absoluteUri);
+                        } else {
+                            emitter.onSuccess(upstreamRequest);
+                        }
+                    } else {
+                        emitter.tryOnError(asyncRequest.cause());
+                    }
+                });
+        });
+    }
+
+    private void resetPendingUpstreamRequest(
+        final HttpExecutionContext ctx,
+        final AtomicReference<HttpClientRequest> pendingUpstreamRequest,
+        final String absoluteUri
+    ) {
+        final HttpClientRequest upstreamRequest = pendingUpstreamRequest.getAndSet(null);
+        if (upstreamRequest != null) {
+            try {
+                ctx.withLogger(log).debug("Downstream request has been disposed, releasing upstream request to [{}]", absoluteUri);
+                if (isHttp2(upstreamRequest)) {
+                    // Releases only this stream; the connection stays shared with the other streams.
+                    upstreamRequest.reset();
+                } else {
+                    // On the connection's own event loop an HTTP/1.x reset recycles the lease inline, so the pool can
+                    // hand the connection to the next waiter before any later close runs and that request fails.
+                    // Closing evicts the connection first. The cost is a new TCP/TLS handshake for the next request.
+                    upstreamRequest.getDelegate().connection().close();
+                }
+            } catch (Exception e) {
+                ctx.withLogger(log).debug("Can't properly reset endpoint request to backend [{}]", absoluteUri, e);
+            }
+        }
+    }
+
+    private void closeFailedUpstreamConnection(
+        final HttpExecutionContext ctx,
+        final AtomicReference<HttpClientRequest> pendingUpstreamRequest,
+        final String absoluteUri
+    ) {
+        final HttpClientRequest upstreamRequest = pendingUpstreamRequest.getAndSet(null);
+        if (upstreamRequest != null) {
+            try {
+                closeConnectionUnlessHttp2(upstreamRequest);
+            } catch (Exception e) {
+                ctx.withLogger(log).debug("Can't properly close the connection to backend [{}] after a failed request", absoluteUri, e);
+            }
+        }
+    }
+
+    /**
+     * An HTTP/1.x connection whose request head was never written, or failed to be, is not closed by a reset: Vert.x
+     * keeps it in the pool although its outbound queue no longer drains, and the next request on it fails. Closing it
+     * makes the pool evict it. An HTTP/2 connection is shared with other streams and is left alone.
+     */
+    private static void closeConnectionUnlessHttp2(final HttpClientRequest upstreamRequest) {
+        if (!isHttp2(upstreamRequest)) {
+            upstreamRequest.getDelegate().connection().close();
+        }
+    }
+
+    private static boolean isHttp2(final HttpClientRequest upstreamRequest) {
+        return upstreamRequest.getDelegate().version() == HttpVersion.HTTP_2;
+    }
+
+    private Single<HttpClientResponse> sendEndpointRequestChunks(HttpClientRequest httpClientRequest, HttpRequest request) {
+        if (hasContentLength(request) && isChunked(request)) {
+            // A request-phase policy (e.g. Assign Content) can rewrite the body, set Content-Length, and
+            // leave the client's Transfer-Encoding: chunked in place. Forwarding both violates RFC 9112
+            // §6.1 and strict backends (NGINX, Jetty) return 400. The body is already de-chunked, so send
+            // it fixed-length: drop Transfer-Encoding and set Content-Length to its actual length. Only
+            // chunked is dropped — a content-coding like gzip must stay, or the backend can't decode the body.
+            httpClientRequest.headers().remove(HttpHeaders.TRANSFER_ENCODING);
+            return request
+                .bodyOrEmpty()
+                .flatMap(body -> {
+                    httpClientRequest.headers().set(HttpHeaders.CONTENT_LENGTH, Integer.toString(body.length()));
+                    return httpClientRequest.rxSend(BufferInternal.buffer(body.getNativeBuffer()));
+                });
+        }
+        if (sendsRequestBodyBytes(request)) {
+            return httpClientRequest.rxSend(request.chunks().map(buffer -> BufferInternal.buffer(buffer.getNativeBuffer())));
+        }
+        // The request body has already been consumed by the caller, which owns it so that the send stays replayable.
+        return httpClientRequest.rxSend();
+    }
+
+    /**
+     * Whether any body byte can reach the backend. Reading the framing headers alone is not enough: a body-less PUT or
+     * DELETE from a real client declares {@code Content-Length: 0} and writes nothing, so it carries no body to send
+     * upstream and stays as safe to re-send as a request with no body header at all. Transfer-Encoding (byte count
+     * unknown upfront, https://www.rfc-editor.org/rfc/rfc9112#section-6-4) and HTTP/2 (Data frames, no header to read,
+     * https://www.rfc-editor.org/rfc/rfc9113#section-8.1-7) announce a body on their own.
+     * <p>
+     * Both call sites must agree on this answer: the client request is a single stream that can only be read once, so
+     * a request whose body is drained by {@link #retryOnceOnConnectionClosedByPeer} must never be read again by
+     * {@link #sendEndpointRequestChunks}.
+     */
+    private static boolean sendsRequestBodyBytes(final HttpRequest request) {
+        if (hasTransferEncoding(request) || request.version() == io.gravitee.common.http.HttpVersion.HTTP_2) {
+            return true;
+        }
+        final String contentLength = request.headers().get(HttpHeaderNames.CONTENT_LENGTH);
+        if (contentLength == null) {
+            return false;
+        }
+        try {
+            return Long.parseLong(contentLength.trim()) != 0;
+        } catch (NumberFormatException e) {
+            // A Content-Length we cannot read says nothing about how many bytes were written: assume a body and
+            // keep the failure off the retry path.
+            return true;
+        }
+    }
+
+    private static boolean isIdempotentMethod(final HttpRequest request) {
+        return IDEMPOTENT_METHODS.contains(request.method());
+    }
+
+    private @NonNull Flowable<Buffer> getEndpointResponseChunks(
+        HttpExecutionContext ctx,
+        HttpClientResponse endpointResponse,
+        HttpResponse response,
+        String absoluteUri
+    ) {
+        // How long the upstream has been silent when the stream breaks is the one measurement that tells a gateway
+        // idle timeout apart from a backend hanging up: the idle timer restarts on every byte received, so only the
+        // gap since the last one can be compared to it. Starts at the response headers, which is the last thing read
+        // from the connection at that point.
+        final AtomicLong lastUpstreamActivityNs = new AtomicLong(System.nanoTime());
+
+        // A broken stream does not always mean a truncated body: a backend that writes its last byte then closes
+        // abruptly — an RST rather than a clean FIN — fails the same way as one that stops mid-body. Counting what
+        // was actually read and comparing it to the announced Content-Length separates the two, so that only genuine
+        // data loss is reported as an error.
+        final AtomicLong bytesReceived = new AtomicLong();
+        final long announcedBodyLength = announcedBodyLength(endpointResponse);
+
+        // A backend failure while streaming the response body (after status/headers were committed) is recorded on
+        // the metrics below so the truncated response is observable instead of reported as a success.
+        return endpointResponse
+            .toFlowable()
+            .doOnNext(chunk -> {
+                lastUpstreamActivityNs.setPlain(System.nanoTime());
+                bytesReceived.addAndGet(chunk.length());
+            })
+            .map(Buffer::buffer)
+            .doOnComplete(() ->
+                // Write trailers when chunks are completed
+                copyHeaders(endpointResponse.trailers(), response.trailers())
+            )
+            .onErrorResumeNext(throwable -> {
+                if (throwable instanceof StreamResetException) {
+                    // Means that we have manually reset the stream because the downstream request has been cancelled (see doOnCancel).
+                    ctx.withLogger(log).debug("Stream reset to the backend [{}]", absoluteUri);
+                } else {
+                    // The response status/headers are already committed to the client, so we cannot change them; record
+                    // the backend failure on the metrics so the (otherwise silent) truncated response is observable.
+                    // That call also logs the failure, with the timeout context needed to interpret it.
+                    final long silenceMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastUpstreamActivityNs.getPlain());
+                    recordBackendResponseStreamFailure(
+                        ctx,
+                        absoluteUri,
+                        silenceMs,
+                        bytesReceived.getPlain(),
+                        announcedBodyLength,
+                        throwable
+                    );
+                }
+                return Flowable.empty();
+            })
+            .doOnCancel(() -> {
+                try {
+                    ctx.withLogger(log).debug("Downstream request has been cancelled, cancelling upstream request to [{}]", absoluteUri);
+
+                    // Reset forces the upstream connection to be closed and avoid consuming the response while downstream is already gone.
+                    endpointResponse.request().reset();
+                } catch (Exception e) {
+                    ctx.withLogger(log).debug("Can't properly reset endpoint request to backend [{}]", absoluteUri, e);
+                }
+            })
+            // Last: covers completion, error and cancellation alike, so a truncated response is measured up to the
+            // point it stopped rather than left at the time to first byte.
+            .doFinally(() -> recordEndpointResponseTime(ctx));
+    }
+
+    /**
+     * Records the time spent acquiring a connection to the endpoint — nginx's {@code $upstream_connect_time}. Without
+     * it, a wait on a saturated connection pool is indistinguishable from a slow backend, since both only show up in
+     * the endpoint response time.
+     */
+    private void recordEndpointConnectTime(final HttpExecutionContext ctx, final long connectStartNs) {
+        final var metrics = ctx.metrics();
+        if (metrics != null) {
+            metrics.setEndpointConnectTimeNs(System.nanoTime() - connectStartNs);
+        }
+    }
+
+    /**
+     * Records the endpoint response time once the response body has been fully proxied. The reactor has already set it
+     * to the time to first byte — which is what a connector that does not stream a body leaves it at; overwriting it
+     * here keeps the body transfer out of the gateway latency, which is derived by subtracting this value from the
+     * total response time.
+     * <p>
+     * This measures the <em>proxied transfer</em> of the body, not the read from the endpoint alone: demand comes from
+     * the client socket and backpressure propagates all the way up, so the body is not read faster than it is written
+     * downstream, and a slow client stretches this duration. That is deliberate — the two are not separable in a
+     * streaming path — but it is why this is not nginx's {@code $upstream_response_time}, which is a read into nginx's
+     * own buffers, nginx buffering responses by default.
+     */
+    private void recordEndpointResponseTime(final HttpExecutionContext ctx) {
+        final var metrics = ctx.metrics();
+        if (metrics != null && metrics.getEndpointRequestStartNs() > 0) {
+            metrics.setEndpointResponseTimeNs(System.nanoTime() - metrics.getEndpointRequestStartNs());
+        }
+    }
+
+    /**
+     * Record a backend failure that happened while streaming the response body, i.e. after the response status and
+     * headers were already committed to the client. The committed response is left untouched; only the metrics are
+     * enriched (and later translated to a diagnostic) so the truncated response is no longer silently reported as a
+     * success. An already-recorded error (e.g. a client abort) is preserved.
+     * <p>
+     * The recorded message is meant to be read on its own, months later, by someone who has the analytics entry and
+     * not the gateway configuration: it names what happened, when, and whether the endpoint's own timeouts are the
+     * likely cause. The log line carries the same information plus the raw configuration and the stack trace, and is
+     * emitted even when the metrics already hold an error, so a truncated body is never silent.
+     */
+    void recordBackendResponseStreamFailure(
+        final HttpExecutionContext ctx,
+        final String absoluteUri,
+        final long silenceMs,
+        final long bytesReceived,
+        final long announcedBodyLength,
+        final Throwable throwable
+    ) {
+        // The backend delivered every byte it announced before the connection broke, so the caller holds a complete
+        // response: only the closure was abrupt, and that costs nothing. Reporting it would raise an error on an
+        // exchange that lost no data — the noisiest kind of false positive, since nothing downstream is affected.
+        if (announcedBodyLength >= 0 && bytesReceived >= announcedBodyLength) {
+            ctx
+                .withLogger(log)
+                .debug(
+                    "Upstream closed the connection abruptly after a complete response body [target={}, bytesReceived={}, announcedContentLength={}]",
+                    absoluteUri,
+                    bytesReceived,
+                    announcedBodyLength
+                );
+            return;
+        }
+
+        final var metrics = ctx.metrics();
+        final long elapsedMs = elapsedMillis(ctx);
+        final String detail = describeStreamFailure(throwable, elapsedMs, silenceMs, bytesReceived, announcedBodyLength);
+
+        // An earlier error (e.g. a client abort) already recorded — preserve it: it describes why the exchange ended,
+        // and the upstream failure observed here is only its consequence.
+        final String alreadyRecorded = metrics != null ? metrics.getErrorKey() : null;
+        String errorKey = alreadyRecorded;
+
+        if (metrics != null && alreadyRecorded == null) {
+            ConnectionFailureClassifier.Classification classification = ConnectionFailureClassifier.classify(throwable);
+
+            // The status and headers are already committed downstream, so the caller received a valid response with a
+            // truncated body. Reporting this as a plain connection failure reads as "the backend could not be
+            // reached", which it could — hence a dedicated key for the case where the upstream simply stopped
+            // mid-body. The generic CONNECTION_CLOSED stays in use for the phases where nothing was sent yet.
+            errorKey = ConnectionFailureClassifier.CONNECTION_CLOSED.equals(classification.key())
+                ? ConnectionFailureClassifier.STREAM_ENDED_EARLY
+                : classification.key();
+
+            // Nothing more to record: the reporter turns errorKey/errorMessage into the Diagnostic carried by the
+            // metrics, attributed to the ENDPOINT component on the GATEWAY_CLIENT_ prefix. Raising an ExecutionWarn
+            // on top would emit a second diagnostic for the same event — and a worse one, the endpoint component
+            // scope being already closed by the time the body is streamed ("Unknown component").
+            metrics.setErrorKey(errorKey);
+            metrics.setErrorMessage(detail);
+        }
+
+        // Single technical log holding everything needed to tell a backend problem from a gateway misconfiguration,
+        // without having to correlate several sources afterwards. WARN, not ERROR: the caller did get a response.
+        ctx
+            .withLogger(log)
+            .warn(
+                "Upstream ended the response body early [target={}, elapsed={}ms, upstreamSilence={}ms, " +
+                    "bytesReceived={}, announcedContentLength={}, bytesSent={}, " +
+                    "status={}, readTimeout={}ms, idleTimeout={}ms, effectiveIdleTimeout={}ms, errorKey={}]: {}",
+                absoluteUri,
+                elapsedMs,
+                silenceMs,
+                bytesReceived,
+                announcedBodyLength,
+                metrics != null ? metrics.getResponseContentLength() : -1,
+                ctx.response().status(),
+                sharedConfiguration.getHttpOptions().getReadTimeout(),
+                sharedConfiguration.getHttpOptions().getIdleTimeout(),
+                effectiveIdleTimeoutMillis(),
+                errorKey,
+                detail,
+                throwable
+            );
+    }
+
+    /**
+     * The {@code Content-Length} the backend advertised, or {@code -1} when it sent none — a chunked response, or one
+     * framed by the connection close itself. Without it there is nothing to measure the body against, so a broken
+     * stream has to be taken at face value. Chunked responses lose nothing by this: their truncation is already
+     * detected by the missing terminal chunk, which is what breaks the stream in the first place.
+     */
+    private long announcedBodyLength(final HttpClientResponse endpointResponse) {
+        final String header = endpointResponse.getHeader(HttpHeaderNames.CONTENT_LENGTH);
+        if (header == null) {
+            return -1L;
+        }
+        try {
+            return Long.parseLong(header.trim());
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    private long elapsedMillis(final HttpExecutionContext ctx) {
+        final var metrics = ctx.metrics();
+        if (metrics == null || metrics.timestamp() == null) {
+            return -1L;
+        }
+        return System.currentTimeMillis() - metrics.timestamp().toEpochMilli();
+    }
+
+    /**
+     * Vert.x applies {@code idleTimeout} with a whole-second resolution, so the value that actually fires is the
+     * configured one truncated down to the second — 12_200 ms behaves as 12_000 ms. Comparing against the configured
+     * value alone would miss the match by a few hundred milliseconds.
+     */
+    private long effectiveIdleTimeoutMillis() {
+        return (sharedConfiguration.getHttpOptions().getIdleTimeout() / 1000) * 1000;
+    }
+
+    /**
+     * Build a message that says what happened <em>and</em>, when the evidence points that way, that the gateway's own
+     * configuration is the likely cause. A connection closed on the gateway's {@code idleTimeout} is indistinguishable
+     * from a backend hanging up unless the silence that preceded it is compared against the configured timeouts —
+     * which is exactly the comparison an operator reading the logs cannot make.
+     *
+     * @param silenceMs time since the last byte read from the upstream, the only duration comparable to
+     *   {@code idleTimeout}: the idle timer restarts on every byte, so the total elapsed time of the exchange says
+     *   nothing about it.
+     */
+    private String describeStreamFailure(
+        final Throwable throwable,
+        final long elapsedMs,
+        final long silenceMs,
+        final long bytesReceived,
+        final long announcedBodyLength
+    ) {
+        final String cause = throwable.getMessage() != null ? throwable.getMessage() : throwable.getClass().getSimpleName();
+
+        final StringBuilder message = new StringBuilder("The backend ended the response body before it was complete (" + cause + ")");
+        if (elapsedMs >= 0) {
+            message.append(", after ").append(elapsedMs).append(" ms");
+        }
+        if (silenceMs >= 0) {
+            message.append(", having received nothing from it for the last ").append(silenceMs).append(" ms");
+        }
+        // Naming the shortfall turns "the body was incomplete" into a measurable claim, and tells the backend team
+        // how much of the response never made it. Absent when the backend announced no Content-Length: the body is
+        // then delimited by the stream itself, and its expected size is unknown.
+        if (announcedBodyLength >= 0) {
+            message
+                .append(". ")
+                .append(bytesReceived)
+                .append(" of the ")
+                .append(announcedBodyLength)
+                .append(" announced bytes were received, so ")
+                .append(announcedBodyLength - bytesReceived)
+                .append(" are missing");
+        }
+
+        final long readTimeout = sharedConfiguration.getHttpOptions().getReadTimeout();
+        final long idleTimeout = sharedConfiguration.getHttpOptions().getIdleTimeout();
+        final long effectiveIdle = effectiveIdleTimeoutMillis();
+
+        if (silenceMs >= 0 && effectiveIdle > 0 && Math.abs(silenceMs - effectiveIdle) <= IDLE_TIMEOUT_MATCH_TOLERANCE_MS) {
+            message
+                .append(". This matches the endpoint idleTimeout (")
+                .append(idleTimeout)
+                .append(" ms, applied as ")
+                .append(effectiveIdle)
+                .append(" ms), so the gateway itself likely closed this connection");
+            if (readTimeout >= idleTimeout) {
+                message
+                    .append(". Note that readTimeout (")
+                    .append(readTimeout)
+                    .append(" ms) is not shorter than idleTimeout, so it can never fire: lowering readTimeout below ")
+                    .append("idleTimeout would surface this as a read timeout instead");
+            }
+        }
+        return message.toString();
+    }
+
+    protected HttpClientRequest customizeHttpClientRequest(final HttpClientRequest httpClientRequest) {
+        return httpClientRequest;
+    }
+
+    protected void copyHeaders(io.vertx.core.MultiMap sourceHeaders, io.gravitee.gateway.api.http.HttpHeaders targetHeaders) {
+        if (sourceHeaders != null && !sourceHeaders.isEmpty()) {
+            if (targetHeaders instanceof VertxHttpHeaders) {
+                // Optimize header copy by relying on delegate.
+                ((VertxHttpHeaders) targetHeaders).getDelegate().addAll(sourceHeaders);
+            } else {
+                // Use regular copy by iterating on headers.
+                sourceHeaders.forEach(entry -> targetHeaders.add(entry.getKey(), entry.getValue()));
+            }
+        }
+    }
+
+    protected RequestOptions buildRequestOptions(HttpExecutionContext ctx) {
+        final RequestOptions requestOptions = new RequestOptions();
+        final HttpRequest request = ctx.request();
+        final io.gravitee.gateway.api.http.HttpHeaders requestHeaders = request.headers();
+        final String originalHost = request.originalHost();
+        final String currentRequestHost = request.host();
+
+        // Remove HOP-by-HOP headers
+        for (CharSequence header : hopHeaders()) {
+            requestHeaders.remove(header.toString());
+        }
+
+        if (currentRequestHost != null) {
+            if (sharedConfiguration.getHttpOptions().isPropagateClientHost() || !Objects.equals(originalHost, currentRequestHost)) {
+                // 'Host' header must be removed unless it has been set during the request flow (non-null and different from original request's host).
+                // If PropagateClientHost is enabled, we set the 'Host' header to the current request's host.
+                requestHeaders.set(HOST, currentRequestHost);
+            } else {
+                requestHeaders.remove(HOST);
+            }
+        }
+        // else: currentRequestHost is null (e.g. health check context); preserve any Host already in requestHeaders from configuration.
+
+        if (!sharedConfiguration.getHttpOptions().isPropagateClientAcceptEncoding()) {
+            // Let the API owner choose the Accept-Encoding between the gateway and the backend.
+            requestHeaders.remove(HttpHeaders.ACCEPT_ENCODING);
+        }
+
+        prepareUriAndQueryParameters(ctx, requestOptions);
+
+        // Override any request headers that are configured at endpoint level.
+        final List<HttpHeader> configHeaders = sharedConfiguration.getHeaders();
+        if (configHeaders != null && !configHeaders.isEmpty()) {
+            configHeaders.forEach(header -> requestHeaders.set(header.getName(), header.getValue()));
+        }
+
+        if (requestHeaders instanceof VertxHttpHeaders) {
+            // Avoid copying headers by reusing the original ones.
+            requestOptions.setHeaders(((VertxHttpHeaders) requestHeaders).getDelegate());
+        } else {
+            final MultiMap headers = HeadersMultiMap.httpHeaders();
+            requestHeaders.names().forEach(name -> headers.add(name, requestHeaders.getAll(name)));
+            requestOptions.setHeaders(headers);
+        }
+
+        return requestOptions
+            .setMethod(HttpMethod.valueOf(request.method().name()))
+            .setTimeout(sharedConfiguration.getHttpOptions().getReadTimeout())
+            .setFollowRedirects(sharedConfiguration.getHttpOptions().isFollowRedirects());
+    }
+
+    protected Set<CharSequence> hopHeaders() {
+        return HOP_HEADERS;
+    }
+
+    private void prepareUriAndQueryParameters(final HttpExecutionContext ctx, final RequestOptions requestOptions) {
+        final HttpRequest request = ctx.request();
+        final MultiValueMap<String, String> requestParameters = new LinkedMultiValueMap<>();
+        request.parameters().forEach((k, v) -> v.forEach(value -> requestParameters.add(k, value)));
+        addParameters(requestParameters, targetParameters);
+
+        String customEndpointTarget = ctx.getAttribute(ATTR_REQUEST_ENDPOINT);
+        String uri = relativeTarget;
+        boolean isRelative = true;
+
+        if (customEndpointTarget != null) {
+            final boolean endpointOverride = Boolean.TRUE.equals(ctx.getAttribute(ATTR_REQUEST_ENDPOINT_OVERRIDE));
+            final MultiValueMap<String, String> customEndpointParameters = URIUtils.parameters(customEndpointTarget);
+
+            if (!customEndpointParameters.isEmpty()) {
+                customEndpointTarget = customEndpointTarget.substring(0, customEndpointTarget.indexOf(URI_QUERY_DELIMITER_CHAR));
+                addParameters(requestParameters, customEndpointParameters);
+            }
+
+            if (URIUtils.isAbsolute(customEndpointTarget)) {
+                uri = customEndpointTarget;
+                isRelative = false;
+            } else {
+                uri = endpointOverride ? customEndpointTarget : relativeTarget + customEndpointTarget;
+            }
+        } else {
+            // Just append the current request path.
+            uri = uri + request.pathInfo();
+        }
+
+        if (isRelative) {
+            UriHelper.configureRelativeUri(requestOptions, uri, requestParameters);
+            requestOptions.setSsl(defaultSsl);
+        } else {
+            UriHelper.configureAbsoluteUri(requestOptions, uri, requestParameters);
+        }
+    }
+
+    private void addParameters(MultiValueMap<String, String> parameters, MultiValueMap<String, String> parametersToAdd) {
+        if (parametersToAdd != null && !parametersToAdd.isEmpty()) {
+            parametersToAdd.forEach((key, values) -> parameters.computeIfAbsent(key, k -> new ArrayList<>()).addAll(values));
+        }
+    }
+
+    private static boolean hasContentLength(HttpRequest request) {
+        return request.headers().get(HttpHeaderNames.CONTENT_LENGTH) != null;
+    }
+
+    private static boolean hasTransferEncoding(HttpRequest request) {
+        return request.headers().get(HttpHeaderNames.TRANSFER_ENCODING) != null;
+    }
+
+    private static boolean isChunked(HttpRequest request) {
+        final String transferEncoding = request.headers().get(HttpHeaderNames.TRANSFER_ENCODING);
+        return transferEncoding != null && HttpHeadersValues.TRANSFER_ENCODING_CHUNKED.equalsIgnoreCase(transferEncoding.trim());
+    }
+}

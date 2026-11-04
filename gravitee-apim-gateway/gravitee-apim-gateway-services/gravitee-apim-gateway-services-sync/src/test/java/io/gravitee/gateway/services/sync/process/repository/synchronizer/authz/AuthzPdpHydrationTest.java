@@ -1,0 +1,459 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.synchronizer.authz;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.gravitee.gateway.env.GatewayConfiguration;
+import io.gravitee.gateway.services.sync.process.common.deployer.AuthzEntityDeployer;
+import io.gravitee.gateway.services.sync.process.common.deployer.AuthzPolicyDeployer;
+import io.gravitee.gateway.services.sync.process.common.deployer.AuthzSchemaDeployer;
+import io.gravitee.gateway.services.sync.process.common.deployer.DeployerFactory;
+import io.gravitee.gateway.services.sync.process.distributed.service.NoopDistributedSyncService;
+import io.gravitee.gateway.services.sync.process.repository.fetcher.LatestEventFetcher;
+import io.gravitee.node.api.Node;
+import io.gravitee.repository.management.model.Event;
+import io.gravitee.repository.management.model.EventType;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
+import io.vertx.core.json.JsonObject;
+import io.vertx.junit5.VertxExtension;
+import io.vertx.rxjava3.core.Vertx;
+import io.vertx.rxjava3.core.eventbus.MessageConsumer;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
+
+@ExtendWith(VertxExtension.class)
+class AuthzPdpHydrationTest {
+
+    private Vertx vertx;
+    private AutoCloseable mocks;
+
+    @Mock
+    private LatestEventFetcher fetcher;
+
+    @Mock
+    private Node node;
+
+    @Mock
+    private GatewayConfiguration gatewayConfiguration;
+
+    @Mock
+    private AuthzEnginePort enginePort;
+
+    private AuthzPdpSynchronizer synchronizer;
+    private AuthzAppliedRevisions revisions;
+    private MessageConsumer<JsonObject> provisionConsumer;
+
+    @BeforeEach
+    void setUp() {
+        mocks = MockitoAnnotations.openMocks(this);
+        vertx = Vertx.vertx();
+        lenient().when(node.id()).thenReturn("gw-1");
+        lenient().when(fetcher.bulkItems()).thenReturn(10);
+        lenient().when(fetcher.fetchLatest(any(), any(), any(), any(), any())).thenReturn(Flowable.empty());
+        lenient().when(gatewayConfiguration.shardingTags()).thenReturn(java.util.Optional.of(java.util.List.of()));
+        lenient()
+            .when(enginePort.addOrUpdatePolicy(any(), any(), any(), any(), any(), anyLong(), any()))
+            .thenReturn(Completable.complete());
+        lenient().when(enginePort.addOrUpdateEntity(any(), any(), any(), any(), any(), anyLong())).thenReturn(Completable.complete());
+        lenient().when(enginePort.addOrUpdateSchema(any(), any(), any(), any(), any(), anyLong())).thenReturn(Completable.complete());
+        lenient().when(enginePort.commit()).thenReturn(Completable.complete());
+        lenient().when(enginePort.commitScope(any(), any())).thenReturn(Completable.complete());
+        provisionConsumer = vertx
+            .eventBus()
+            .consumer(AuthzPdpSynchronizer.PROVISION_ADDRESS, message -> message.reply(new JsonObject().put("ok", true)));
+
+        NoopDistributedSyncService distributedSyncService = new NoopDistributedSyncService();
+        DeployerFactory deployerFactory = org.mockito.Mockito.mock(DeployerFactory.class);
+        lenient().when(deployerFactory.createAuthzPolicyDeployer()).thenReturn(new AuthzPolicyDeployer(enginePort, distributedSyncService));
+        lenient().when(deployerFactory.createAuthzEntityDeployer()).thenReturn(new AuthzEntityDeployer(enginePort, distributedSyncService));
+        lenient().when(deployerFactory.createAuthzSchemaDeployer()).thenReturn(new AuthzSchemaDeployer(enginePort));
+
+        AuthzPolicySynchronizer policySynchronizer = new AuthzPolicySynchronizer(
+            fetcher,
+            new AuthzPolicyMapper(new ObjectMapper()),
+            deployerFactory,
+            enginePort,
+            new AuthzScopePlacement(),
+            executor(),
+            executor()
+        );
+
+        AuthzSchemaSynchronizer schemaSynchronizer = new AuthzSchemaSynchronizer(
+            fetcher,
+            new AuthzSchemaMapper(new ObjectMapper()),
+            deployerFactory,
+            enginePort,
+            new AuthzScopePlacement(),
+            executor(),
+            executor()
+        );
+        AuthzEntitySynchronizer entitySynchronizer = new AuthzEntitySynchronizer(
+            fetcher,
+            new AuthzEntityMapper(new ObjectMapper()),
+            deployerFactory,
+            enginePort,
+            new AuthzScopePlacement(),
+            executor(),
+            executor()
+        );
+        revisions = new AuthzAppliedRevisions();
+        synchronizer = new AuthzPdpSynchronizer(
+            fetcher,
+            new AuthzPdpMapper(new ObjectMapper()),
+            schemaSynchronizer,
+            policySynchronizer,
+            entitySynchronizer,
+            node,
+            gatewayConfiguration,
+            vertx,
+            new AuthzHostedScopes(),
+            executor(),
+            executor(),
+            revisions
+        );
+    }
+
+    private static ThreadPoolExecutor executor() {
+        return new ThreadPoolExecutor(1, 1, 15L, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+    }
+
+    @AfterEach
+    void tearDown() throws Exception {
+        provisionConsumer.unregister();
+        vertx.close();
+        mocks.close();
+    }
+
+    @Test
+    void provision_backfills_matching_policies_and_entities_then_commits() throws InterruptedException {
+        Event provision = pdpEvent("evt-p", EventType.PUBLISH_AUTHZ_PDP, "scope-1", "");
+        Event policyInScope = policyEvent("pol-1", "scope-1");
+        Event policyWildcard = policyEvent("pol-2", "*");
+        Event policyOtherScope = policyEvent("pol-3", "scope-9");
+        Event entityInScope = entityEvent("ent-1", "scope-1");
+
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_SCHEMA_ID), any(), any())).thenReturn(Flowable.empty());
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_POLICY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(policyInScope, policyWildcard, policyOtherScope))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_ENTITY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(entityInScope))
+        );
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-1"), any(), any(), eq(Set.of("scope-1")), anyLong(), any());
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-2"), any(), any(), eq(Set.of("scope-1")), anyLong(), any());
+        verify(enginePort, never()).addOrUpdatePolicy(any(), eq("pol-3"), any(), any(), any(), anyLong(), any());
+        verify(enginePort).addOrUpdateEntity(eq("env-pdp"), any(), any(), any(), eq(Set.of("scope-1")), anyLong());
+        verify(enginePort, times(1)).commitScope("env-pdp", "scope-1");
+    }
+
+    @Test
+    void backfill_routes_only_matching_scopes_to_provisioned_scope_never_to_other_scope() throws InterruptedException {
+        Event provision = pdpEvent("evt-p", EventType.PUBLISH_AUTHZ_PDP, "scope-x", "");
+        Event policyX = policyEvent("pol-x", "scope-x");
+        Event policyWildcard = policyEvent("pol-w", "*");
+        Event policyOther = policyEvent("pol-other", "scope-other");
+        Event policyMulti = policyEventMulti("pol-multi", "scope-other", "scope-x");
+
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_SCHEMA_ID), any(), any())).thenReturn(Flowable.empty());
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_POLICY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(policyX, policyWildcard, policyOther, policyMulti))
+        );
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-x"), any(), any(), eq(Set.of("scope-x")), anyLong(), any());
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-w"), any(), any(), eq(Set.of("scope-x")), anyLong(), any());
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-multi"), any(), any(), eq(Set.of("scope-x")), anyLong(), any());
+        verify(enginePort, never()).addOrUpdatePolicy(any(), eq("pol-other"), any(), any(), any(), anyLong(), any());
+        verify(enginePort, never()).addOrUpdatePolicy(any(), any(), any(), any(), eq(Set.of("scope-other")), anyLong(), any());
+    }
+
+    @Test
+    void backfill_does_not_apply_a_foreign_environment_policy_to_the_provisioned_scope() throws InterruptedException {
+        Event provision = pdpEvent("evt-p", EventType.PUBLISH_AUTHZ_PDP, "scope-shared", "");
+        Event ownPolicy = policyEventEnv("pol-own", "env-pdp", "scope-shared");
+        Event foreignPolicy = policyEventEnv("pol-foreign", "env-other", "scope-shared");
+        Event foreignWildcard = policyEventEnv("pol-foreign-w", "env-other", "*");
+
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_SCHEMA_ID), any(), any())).thenReturn(Flowable.empty());
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_POLICY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(ownPolicy, foreignPolicy, foreignWildcard))
+        );
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-pdp", "env-other")).test().await().assertComplete();
+
+        verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-own"), any(), any(), eq(Set.of("scope-shared")), anyLong(), any());
+        verify(enginePort, never()).addOrUpdatePolicy(any(), eq("pol-foreign"), any(), any(), any(), anyLong(), any());
+        verify(enginePort, never()).addOrUpdatePolicy(any(), eq("pol-foreign-w"), any(), any(), any(), anyLong(), any());
+    }
+
+    @Test
+    void backfill_does_not_apply_a_foreign_environment_entity_to_the_provisioned_scope() throws InterruptedException {
+        Event provision = pdpEvent("evt-p", EventType.PUBLISH_AUTHZ_PDP, "scope-shared", "");
+        Event ownEntity = entityEventEnv("ent-own", "env-pdp", "scope-shared");
+        Event foreignEntity = entityEventEnv("ent-foreign", "env-other", "scope-shared");
+
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_ENTITY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(ownEntity, foreignEntity))
+        );
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-pdp", "env-other")).test().await().assertComplete();
+
+        verify(enginePort).addOrUpdateEntity(eq("env-pdp"), any(), any(), any(), eq(Set.of("scope-shared")), anyLong());
+        verify(enginePort, times(1)).addOrUpdateEntity(any(), any(), any(), any(), any(), anyLong());
+    }
+
+    @Test
+    void empty_scope_with_no_policies_or_entities_still_commits_once() throws InterruptedException {
+        Event provision = pdpEvent("evt-empty", EventType.PUBLISH_AUTHZ_PDP, "scope-empty", "");
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        // no policy / entity events at all for this scope
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        verify(enginePort, never()).addOrUpdatePolicy(any(), any(), any(), any(), any(), anyLong(), any());
+        verify(enginePort, never()).addOrUpdateEntity(any(), any(), any(), any(), any(), anyLong());
+        // the scope must still seal generation 0 so it does not stay cold forever (once per synchronizer)
+        verify(enginePort, times(1)).commitScope("env-pdp", "scope-empty");
+    }
+
+    @Test
+    void evict_does_not_backfill() throws InterruptedException {
+        Event evict = pdpEvent("evt-u", EventType.UNPUBLISH_AUTHZ_PDP, "scope-2", "");
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(evict))
+        );
+
+        synchronizer.synchronize(123L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        verify(enginePort, never()).addOrUpdatePolicy(any(), any(), any(), any(), any(), anyLong(), any());
+        verify(enginePort, never()).addOrUpdateEntity(any(), any(), any(), any(), any(), anyLong());
+        verify(enginePort, never()).commitScope(any(), any());
+    }
+
+    @Test
+    void failing_hydration_is_abandoned_after_the_retry_cap_instead_of_redriving_forever() throws InterruptedException {
+        Event provision = pdpEvent("evt-h", EventType.PUBLISH_AUTHZ_PDP, "scope-fail", "");
+        // PDP event only on the first (initial) cycle; later cycles see no new events, so the scope
+        // lives solely in pendingHydrations and exercises the re-drive bound rather than being
+        // re-provisioned (which would reset the attempt counter every cycle).
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision)),
+            Flowable.empty()
+        );
+        // Hydration commit fails every time, so the scope is re-queued into pendingHydrations.
+        when(enginePort.commitScope(eq("env-pdp"), eq("scope-fail"))).thenReturn(Completable.error(new RuntimeException("boom")));
+
+        // Initial sync hydrates once (fresh attempt); incremental cycles then re-drive the failure.
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+        for (int i = 0; i < AuthzPdpSynchronizer.MAX_PENDING_ATTEMPTS + 5; i++) {
+            synchronizer.synchronize(123L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+        }
+
+        // 1 fresh attempt + MAX_PENDING_ATTEMPTS re-drives, then abandoned — not unbounded.
+        verify(enginePort, times(AuthzPdpSynchronizer.MAX_PENDING_ATTEMPTS + 1)).commitScope("env-pdp", "scope-fail");
+    }
+
+    @Test
+    void evict_of_a_tagged_pdp_forgets_every_tag_variant_revision_so_a_reprovision_re_hydrates() throws InterruptedException {
+        // A prior hydration marked the tagged scope's docs under its routing scope (orders@eu). Forgetting
+        // only the bare id on evict would leave those marks in place, and a re-provision would then gate out
+        // every doc — engine empty while hydration looks successful. The evict must drop the tagged bucket.
+        revisions.markApplied("env-pdp", "orders@eu", "pol-1", 100L);
+        revisions.markApplied("env-pdp", "orders@eu", "ent-1", 100L);
+        assertThat(revisions.shouldApply("env-pdp", "orders@eu", "pol-1", 100L)).isFalse();
+
+        Event evict = pdpEvent("evt-u", EventType.UNPUBLISH_AUTHZ_PDP, "orders", "eu");
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(evict))
+        );
+
+        synchronizer.synchronize(123L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        assertThat(revisions.shouldApply("env-pdp", "orders@eu", "pol-1", 100L)).isTrue();
+        assertThat(revisions.shouldApply("env-pdp", "orders@eu", "ent-1", 100L)).isTrue();
+    }
+
+    private static Event pdpEvent(String id, EventType type, String targetPdpId, String tag) {
+        Event event = new Event();
+        event.setId(id);
+        event.setType(type);
+        event.setPayload(new JsonObject().put("targetPdpId", targetPdpId).put("tag", tag).put("environmentId", "env-pdp").encode());
+        event.setProperties(Map.of(Event.EventProperties.AUTHZ_PDP_ID.getValue(), id));
+        return event;
+    }
+
+    @Test
+    void hydration_stages_the_schema_before_the_policies_of_the_same_scope() throws InterruptedException {
+        Event provision = pdpEvent("evt-pdp", EventType.PUBLISH_AUTHZ_PDP, "scope-1", null);
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_PDP_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(provision))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_SCHEMA_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(schemaEvent("sch-1", "scope-1")))
+        );
+        when(fetcher.fetchLatest(any(), any(), eq(Event.EventProperties.AUTHZ_POLICY_ID), any(), any())).thenReturn(
+            Flowable.just(List.of(policyEvent("pol-1", "scope-1")))
+        );
+
+        synchronizer.synchronize(-1L, Instant.now().toEpochMilli(), Set.of("env-1")).test().await().assertComplete();
+
+        // A freshly provisioned scope must carry the schema on its very first commit: a policy that names a
+        // type the schema declares would otherwise be staged against an engine that has no schema yet.
+        InOrder inOrder = inOrder(enginePort);
+        inOrder.verify(enginePort).addOrUpdateSchema(eq("env-pdp"), eq("sch-1"), any(), any(), eq(Set.of("scope-1")), anyLong());
+        inOrder.verify(enginePort).addOrUpdatePolicy(eq("env-pdp"), eq("pol-1"), any(), any(), eq(Set.of("scope-1")), anyLong(), any());
+    }
+
+    private static Event schemaEvent(String docId, String targetPdpId) {
+        Event event = new Event();
+        event.setId(docId);
+        event.setType(EventType.PUBLISH_AUTHZ_SCHEMA);
+        event.setPayload(
+            new JsonObject()
+                .put("id", docId)
+                .put("name", docId)
+                .put("schemaText", "entity User;")
+                .put("environmentId", "env-pdp")
+                .put("targetPdpIds", List.of(targetPdpId))
+                .encode()
+        );
+        event.setUpdatedAt(new java.util.Date());
+        return event;
+    }
+
+    private static Event policyEvent(String docId, String targetPdpId) {
+        Event event = new Event();
+        event.setId(docId);
+        event.setType(EventType.PUBLISH_AUTHZ_POLICY);
+        event.setPayload(
+            new JsonObject()
+                .put("id", docId)
+                .put("name", docId)
+                .put("kind", "GLOBAL")
+                .put("policyText", "permit();")
+                .put("environmentId", "env-pdp")
+                .put("targetPdpIds", List.of(targetPdpId))
+                .encode()
+        );
+        return event;
+    }
+
+    private static Event policyEventMulti(String docId, String... targetPdpIds) {
+        Event event = new Event();
+        event.setId(docId);
+        event.setType(EventType.PUBLISH_AUTHZ_POLICY);
+        event.setPayload(
+            new JsonObject()
+                .put("id", docId)
+                .put("name", docId)
+                .put("kind", "GLOBAL")
+                .put("policyText", "permit();")
+                .put("environmentId", "env-pdp")
+                .put("targetPdpIds", List.of(targetPdpIds))
+                .encode()
+        );
+        return event;
+    }
+
+    private static Event entityEvent(String entityId, String targetPdpId) {
+        Event event = new Event();
+        event.setId(entityId);
+        event.setType(EventType.PUBLISH_AUTHZ_ENTITY);
+        event.setPayload(
+            new JsonObject()
+                .put("entityId", entityId)
+                .put("kind", "RESOURCE")
+                .put("environmentId", "env-pdp")
+                .put("targetPdpIds", List.of(targetPdpId))
+                .encode()
+        );
+        return event;
+    }
+
+    private static Event policyEventEnv(String docId, String environmentId, String targetPdpId) {
+        Event event = new Event();
+        event.setId(docId);
+        event.setType(EventType.PUBLISH_AUTHZ_POLICY);
+        event.setPayload(
+            new JsonObject()
+                .put("id", docId)
+                .put("name", docId)
+                .put("kind", "GLOBAL")
+                .put("policyText", "permit();")
+                .put("environmentId", environmentId)
+                .put("targetPdpIds", List.of(targetPdpId))
+                .encode()
+        );
+        return event;
+    }
+
+    private static Event entityEventEnv(String entityId, String environmentId, String targetPdpId) {
+        Event event = new Event();
+        event.setId(entityId);
+        event.setType(EventType.PUBLISH_AUTHZ_ENTITY);
+        event.setPayload(
+            new JsonObject()
+                .put("entityId", entityId)
+                .put("kind", "RESOURCE")
+                .put("environmentId", environmentId)
+                .put("targetPdpIds", List.of(targetPdpId))
+                .encode()
+        );
+        return event;
+    }
+}

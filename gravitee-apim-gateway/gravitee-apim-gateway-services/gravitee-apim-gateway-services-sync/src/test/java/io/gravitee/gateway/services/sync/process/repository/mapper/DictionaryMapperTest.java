@@ -1,0 +1,135 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.mapper;
+
+import static io.gravitee.repository.management.model.Event.EventProperties.DICTIONARY_ID;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.gravitee.definition.jackson.datatype.GraviteeMapper;
+import io.gravitee.repository.management.model.Event;
+import java.util.Map;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayNameGeneration;
+import org.junit.jupiter.api.DisplayNameGenerator;
+import org.junit.jupiter.api.Test;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
+class DictionaryMapperTest {
+
+    private final ObjectMapper objectMapper = new GraviteeMapper();
+    private DictionaryMapper cut;
+
+    @BeforeEach
+    public void beforeEach() {
+        cut = new DictionaryMapper(objectMapper);
+    }
+
+    @Test
+    void should_map_dictionary() throws JsonProcessingException {
+        io.gravitee.gateway.dictionary.model.Dictionary dictionaryExpected = new io.gravitee.gateway.dictionary.model.Dictionary();
+        Event event = new Event();
+        event.setPayload(objectMapper.writeValueAsString(dictionaryExpected));
+        cut
+            .to(event)
+            .test()
+            .assertValue(dictionary -> {
+                assertThat(dictionary).isEqualTo(dictionaryExpected);
+                return true;
+            })
+            .assertComplete();
+    }
+
+    @Test
+    void should_return_empty_with_mapping_error() throws JsonProcessingException {
+        Event event = new Event();
+        event.setPayload(objectMapper.writeValueAsString("wrong"));
+        cut.to(event).test().assertNoValues().assertComplete();
+    }
+
+    @Test
+    void should_map_dictionary_with_legacy_bare_string_properties() throws JsonProcessingException {
+        Event event = new Event();
+        event.setPayload("{\"properties\":{\"legacy-key\":\"legacy-value\"}}");
+
+        cut
+            .to(event)
+            .test()
+            .assertValue(dictionary -> {
+                assertThat(dictionary.getProperties().get("legacy-key").value()).isEqualTo("legacy-value");
+                assertThat(dictionary.getProperties().get("legacy-key").encrypted()).isFalse();
+                return true;
+            })
+            .assertComplete();
+    }
+
+    @Test
+    void should_map_dictionary_mixing_legacy_and_typed_properties() throws JsonProcessingException {
+        // The rolling-upgrade payload: a dictionary saved before the typed shape existed, with one
+        // property since encrypted.
+        Event event = new Event();
+        event.setPayload("{\"properties\":{\"legacy-key\":\"legacy-value\",\"typed-key\":{\"value\":\"cipher\",\"encrypted\":true}}}");
+
+        cut
+            .to(event)
+            .test()
+            .assertValue(dictionary -> {
+                assertThat(dictionary.getProperties().get("legacy-key").value()).isEqualTo("legacy-value");
+                assertThat(dictionary.getProperties().get("legacy-key").encrypted()).isFalse();
+                assertThat(dictionary.getProperties().get("typed-key").value()).isEqualTo("cipher");
+                assertThat(dictionary.getProperties().get("typed-key").encrypted()).isTrue();
+                return true;
+            })
+            .assertComplete();
+    }
+
+    @Test
+    void should_skip_only_the_null_property_of_a_legacy_payload() {
+        Event event = new Event();
+        event.setPayload("{\"properties\":{\"legacy-key\":\"legacy-value\",\"null-key\":null}}");
+
+        cut
+            .to(event)
+            .test()
+            .assertValue(dictionary -> {
+                assertThat(dictionary.getProperties()).containsOnlyKeys("legacy-key");
+                assertThat(dictionary.getProperties().get("legacy-key").value()).isEqualTo("legacy-value");
+                return true;
+            })
+            .assertComplete();
+    }
+
+    @Test
+    void should_map_dictionary_with_typed_properties() throws JsonProcessingException {
+        Event event = new Event();
+        event.setPayload("{\"properties\":{\"typed-key\":{\"value\":\"cipher\",\"encrypted\":true}}}");
+
+        cut
+            .to(event)
+            .test()
+            .assertValue(dictionary -> {
+                assertThat(dictionary.getProperties().get("typed-key").value()).isEqualTo("cipher");
+                assertThat(dictionary.getProperties().get("typed-key").encrypted()).isTrue();
+                return true;
+            })
+            .assertComplete();
+    }
+}

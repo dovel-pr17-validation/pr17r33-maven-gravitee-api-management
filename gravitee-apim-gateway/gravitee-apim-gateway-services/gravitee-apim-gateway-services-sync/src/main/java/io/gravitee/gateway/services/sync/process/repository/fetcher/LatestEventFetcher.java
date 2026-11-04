@@ -1,0 +1,183 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.services.sync.process.repository.fetcher;
+
+import io.gravitee.gateway.services.sync.process.repository.DefaultSyncManager;
+import io.gravitee.repository.management.api.EventLatestRepository;
+import io.gravitee.repository.management.api.search.EventCriteria;
+import io.gravitee.repository.management.api.search.EventLatestCursor;
+import io.gravitee.repository.management.api.search.EventLatestPage;
+import io.gravitee.repository.management.model.Event;
+import io.gravitee.repository.management.model.EventType;
+import io.reactivex.rxjava3.core.Flowable;
+import java.util.List;
+import java.util.Set;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.CustomLog;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.experimental.Accessors;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+@RequiredArgsConstructor
+public class LatestEventFetcher {
+
+    private final EventLatestRepository eventLatestRepository;
+
+    @Getter
+    @Accessors(fluent = true)
+    private final int bulkItems;
+
+    public Flowable<List<Event>> fetchLatest(
+        Long from,
+        Long to,
+        Event.EventProperties group,
+        Set<String> environments,
+        Set<EventType> eventTypes
+    ) {
+        return fetchLatest(from, to, group, null, null, environments, eventTypes);
+    }
+
+    public Flowable<List<Event>> fetchLatest(
+        Long from,
+        Long to,
+        Event.EventProperties group,
+        Event.EventProperties propertyKey,
+        String propertyValue,
+        Set<String> environments,
+        Set<EventType> eventTypes
+    ) {
+        EventCriteria criteria = buildCriteria(from, to, propertyKey, propertyValue, environments, eventTypes);
+        return Flowable.<List<Event>, SeekPage>generate(
+            () -> new SeekPage(),
+            (page, emitter) -> {
+                try {
+                    List<Event> events = nextPage(page, criteria, group);
+                    if (events != null && !events.isEmpty()) {
+                        emitter.onNext(events);
+                        page.index++;
+                    }
+                    if (events == null || events.size() < bulkItems) {
+                        emitter.onComplete();
+                    }
+                } catch (Exception e) {
+                    emitter.onError(e);
+                }
+            }
+        );
+    }
+
+    private List<Event> nextPage(SeekPage page, EventCriteria criteria, Event.EventProperties group) {
+        if (!page.offsetOnly) {
+            try {
+                EventLatestPage latest = eventLatestRepository.searchAfter(criteria, group, page.cursor, bulkItems);
+                page.cursor = latest.next();
+                return latest.events();
+            } catch (UnsupportedOperationException e) {
+                if (page.cursor != null) {
+                    throw e;
+                }
+                log.debug("Latest events are paged by offset: {}", e.getMessage());
+                page.offsetOnly = true;
+            }
+        }
+        return eventLatestRepository.search(criteria, group, page.index, (long) bulkItems);
+    }
+
+    private EventCriteria buildCriteria(
+        Long from,
+        Long to,
+        Event.EventProperties propertyKey,
+        String propertyValue,
+        Set<String> environments,
+        Set<EventType> eventTypes
+    ) {
+        EventCriteria.EventCriteriaBuilder builder = EventCriteria.builder()
+            .types(eventTypes)
+            .from(from == null ? -1 : from - DefaultSyncManager.TIMEFRAME_DELAY)
+            .to(to == null ? -1 : to + DefaultSyncManager.TIMEFRAME_DELAY)
+            .environments(environments);
+        if (propertyKey != null && propertyValue != null) {
+            builder.property(propertyKey.getValue(), propertyValue);
+        }
+        return builder.build();
+    }
+
+    /**
+     * Latest events of the given APIs, one page at a time.
+     *
+     * <p>Paginated like {@link #fetchLatest}: an event payload carries a whole API definition, so
+     * loading them all at once would hold every member API of a product in memory for the duration
+     * of the resync. A repository failure ends the stream after a warning rather than failing the
+     * caller, so one unreadable page cannot abort a resync.</p>
+     */
+    public Flowable<List<Event>> fetchLatestForApiIds(Set<String> apiIds, Set<String> environments, Set<EventType> eventTypes) {
+        if (apiIds == null || apiIds.isEmpty()) {
+            return Flowable.empty();
+        }
+        return Flowable.<List<Event>, EventPageable>generate(
+            () ->
+                EventPageable.builder()
+                    .index(0)
+                    .size(bulkItems)
+                    .criteria(
+                        EventCriteria.builder()
+                            .types(eventTypes)
+                            .environments(environments)
+                            .property(Event.EventProperties.API_ID.getValue(), apiIds)
+                            .build()
+                    )
+                    .build(),
+            (page, emitter) -> {
+                try {
+                    List<Event> events = eventLatestRepository.search(page.criteria, Event.EventProperties.API_ID, page.index, page.size);
+                    if (events != null && !events.isEmpty()) {
+                        emitter.onNext(events);
+                        page.index++;
+                    }
+                    if (events == null || events.size() < page.size) {
+                        emitter.onComplete();
+                    }
+                } catch (Exception e) {
+                    log.warn("Failed to batch-fetch latest events for {} API(s): {}", apiIds.size(), e.getMessage());
+                    emitter.onComplete();
+                }
+            }
+        );
+    }
+
+    private static class SeekPage {
+
+        private long index;
+        private EventLatestCursor cursor;
+        private boolean offsetOnly;
+    }
+
+    @Builder
+    @AllArgsConstructor
+    @Getter
+    private static class EventPageable {
+
+        private long index;
+        private long size;
+        private EventCriteria criteria;
+    }
+}

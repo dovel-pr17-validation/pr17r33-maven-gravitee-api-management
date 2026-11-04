@@ -1,0 +1,371 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.core.context;
+
+import io.gravitee.common.util.ListUtils;
+import io.gravitee.el.TemplateContext;
+import io.gravitee.el.TemplateEngine;
+import io.gravitee.gateway.api.buffer.Buffer;
+import io.gravitee.gateway.reactive.api.ExecutionFailure;
+import io.gravitee.gateway.reactive.api.ExecutionWarn;
+import io.gravitee.gateway.reactive.api.context.ExecutionContext;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
+import io.gravitee.gateway.reactive.api.context.TlsSession;
+import io.gravitee.gateway.reactive.api.context.http.HttpExecutionContext;
+import io.gravitee.gateway.reactive.api.context.http.HttpPlainExecutionContext;
+import io.gravitee.gateway.reactive.api.el.EvaluableMessage;
+import io.gravitee.gateway.reactive.api.el.EvaluableRequest;
+import io.gravitee.gateway.reactive.api.el.EvaluableResponse;
+import io.gravitee.gateway.reactive.api.message.Message;
+import io.gravitee.gateway.reactive.api.policy.base.BasePolicy;
+import io.gravitee.gateway.reactive.core.context.diagnostic.DiagnosticReportHelper;
+import io.gravitee.gateway.reactive.core.context.interruption.InterruptionException;
+import io.gravitee.gateway.reactive.core.context.interruption.InterruptionFailureException;
+import io.gravitee.reporter.api.v4.metric.Metrics;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Maybe;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import lombok.Getter;
+import lombok.Setter;
+
+public abstract class AbstractExecutionContext<RQ extends MutableRequest, RS extends MutableResponse>
+    extends AbstractBaseExecutionContext
+    implements ExecutionContext, io.gravitee.gateway.reactive.api.context.http.HttpExecutionContext {
+
+    protected RQ request;
+    protected RS response;
+    protected Metrics metrics;
+
+    @Setter
+    protected boolean warningsEnabled = true;
+
+    private EvaluableRequest evaluableRequest;
+    private EvaluableResponse evaluableResponse;
+    private EvaluableExecutionContext evaluableExecutionContext;
+
+    private List<BiConsumer<String, Object>> attributeChangeListeners;
+
+    @Getter
+    private Map<BasePolicy, Function<HttpExecutionContext, Completable>> onResponseActions = null;
+
+    private Map<BasePolicy, Function<HttpExecutionContext, Completable>> onTerminateActions = null;
+
+    public AbstractExecutionContext(final RQ request, final RS response) {
+        this.request = request;
+        this.response = response;
+    }
+
+    @Override
+    public RQ request() {
+        return request;
+    }
+
+    @Override
+    public RS response() {
+        return response;
+    }
+
+    @Override
+    public Metrics metrics() {
+        return metrics;
+    }
+
+    @Override
+    public Completable interrupt() {
+        return messagesInterruption();
+    }
+
+    @Override
+    public Completable interruptWith(ExecutionFailure executionFailure) {
+        return Completable.defer(() -> {
+            internalAttributes.put(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_FAILURE, executionFailure);
+            ComponentScope.ComponentEntry componentEntry = ComponentScope.peek(this);
+            metrics.setFailure(
+                DiagnosticReportHelper.fromExecutionFailure(
+                    componentEntry,
+                    metrics.getErrorKey(),
+                    metrics.getErrorMessage(),
+                    executionFailure
+                )
+            );
+            return Completable.error(new InterruptionFailureException(executionFailure));
+        });
+    }
+
+    @Override
+    public void warnWith(ExecutionWarn warn) {
+        // Check if warning reporting is enabled before processing the warning
+        if (!warningsEnabled) {
+            return;
+        }
+
+        List<ExecutionWarn> warnings = getInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_WARN);
+        if (warnings == null) {
+            warnings = new LinkedList<>();
+            setInternalAttribute(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_WARN, warnings);
+        }
+        warnings.add(warn);
+        ComponentScope.ComponentEntry componentEntry = ComponentScope.peek(this);
+        metrics.addWarning(DiagnosticReportHelper.fromExecutionWarn(componentEntry, warn));
+    }
+
+    @Override
+    public Maybe<Buffer> interruptBody() {
+        return interrupt().toMaybe();
+    }
+
+    @Override
+    public Maybe<Buffer> interruptBodyWith(final ExecutionFailure failure) {
+        return interruptWith(failure).toMaybe();
+    }
+
+    @Override
+    public Flowable<Message> interruptMessages() {
+        return messagesInterruption().toFlowable();
+    }
+
+    @Override
+    public Maybe<Message> interruptMessage() {
+        return messagesInterruption().toMaybe();
+    }
+
+    private Completable messagesInterruption() {
+        return Completable.error(new InterruptionException());
+    }
+
+    @Override
+    public Flowable<Message> interruptMessagesWith(final ExecutionFailure executionFailure) {
+        return messageInterruptionFailure(executionFailure).toFlowable();
+    }
+
+    @Override
+    public Maybe<Message> interruptMessageWith(final ExecutionFailure executionFailure) {
+        return messageInterruptionFailure(executionFailure).toMaybe();
+    }
+
+    private Completable messageInterruptionFailure(final ExecutionFailure executionFailure) {
+        return Completable.defer(() -> {
+            internalAttributes.put(InternalContextAttributes.ATTR_INTERNAL_EXECUTION_FAILURE, executionFailure);
+            return Completable.error(new InterruptionFailureException(executionFailure));
+        });
+    }
+
+    @Override
+    public <T> T getComponent(Class<T> componentClass) {
+        return componentProvider.getComponent(componentClass);
+    }
+
+    public void registerAttributeChangeListener(BiConsumer<String, Object> listener) {
+        if (attributeChangeListeners == null) {
+            attributeChangeListeners = new ArrayList<>();
+        }
+        attributeChangeListeners.add(listener);
+    }
+
+    @Override
+    public void setAttribute(String name, Object value) {
+        putAttribute(name, value);
+    }
+
+    @Override
+    public void putAttribute(String name, Object value) {
+        attributes.put(name, value);
+        notifyAttributeChangeListeners(name, value);
+    }
+
+    @Override
+    public void removeAttribute(String name) {
+        attributes.remove(name);
+        notifyAttributeChangeListeners(name, null);
+    }
+
+    private void notifyAttributeChangeListeners(String name, Object value) {
+        if (attributeChangeListeners != null) {
+            attributeChangeListeners.forEach(l -> l.accept(name, value));
+        }
+    }
+
+    @Override
+    public <T> T getAttribute(String name) {
+        return (T) attributes.get(name);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> List<T> getAttributeAsList(String name) {
+        return ListUtils.toList(attributes.get(name));
+    }
+
+    @Override
+    public Set<String> getAttributeNames() {
+        return attributes.keySet();
+    }
+
+    @Override
+    public <T> Map<String, T> getAttributes() {
+        return (Map<String, T>) this.attributes;
+    }
+
+    @Override
+    public void setInternalAttribute(String name, Object value) {
+        putInternalAttribute(name, value);
+    }
+
+    @Override
+    public void putInternalAttribute(String name, Object value) {
+        internalAttributes.put(name, value);
+    }
+
+    @Override
+    public void removeInternalAttribute(String name) {
+        internalAttributes.remove(name);
+    }
+
+    @Override
+    public <T> T getInternalAttribute(String name) {
+        return (T) internalAttributes.get(name);
+    }
+
+    @Override
+    public <T> Map<String, T> getInternalAttributes() {
+        return (Map<String, T>) internalAttributes;
+    }
+
+    @Override
+    public String remoteAddress() {
+        return this.request.remoteAddress();
+    }
+
+    @Override
+    public String localAddress() {
+        return this.request.localAddress();
+    }
+
+    @Override
+    public TlsSession tlsSession() {
+        return this.request.tlsSession();
+    }
+
+    @Override
+    public TemplateEngine getTemplateEngine() {
+        if (templateEngine == null) {
+            templateEngine = TemplateEngine.templateEngine();
+            prepareTemplateEngine(templateEngine);
+            if (templateVariableProviders != null) {
+                templateVariableProviders.forEach(templateVariableProvider -> {
+                    if (templateVariableProvider instanceof ExecutionContextTemplateVariableProvider ctxTemplateVariableProvider) {
+                        ctxTemplateVariableProvider.provide(this);
+                    } else {
+                        templateVariableProvider.provide(templateEngine.getTemplateContext());
+                    }
+                });
+            }
+        }
+
+        return templateEngine;
+    }
+
+    @Override
+    public TemplateEngine getTemplateEngine(Message message) {
+        final TemplateEngine engine = TemplateEngine.fromTemplateEngine(this.getTemplateEngine());
+        engine.getTemplateContext().setVariable(TEMPLATE_ATTRIBUTE_MESSAGE, new EvaluableMessage(message));
+        return engine;
+    }
+
+    @Override
+    public void addActionOnResponse(BasePolicy source, Function<HttpExecutionContext, Completable> function) {
+        if (onResponseActions == null) {
+            onResponseActions = new HashMap<>();
+        }
+
+        onResponseActions.put(source, function);
+    }
+
+    public Function<HttpExecutionContext, Completable> getOnResponseAction(BasePolicy source) {
+        if (onResponseActions == null) {
+            return null;
+        }
+        return onResponseActions.get(source);
+    }
+
+    @Override
+    public void addActionOnTerminate(BasePolicy source, Function<HttpExecutionContext, Completable> function) {
+        if (onTerminateActions == null) {
+            onTerminateActions = new LinkedHashMap<>();
+        }
+
+        onTerminateActions.put(source, function);
+    }
+
+    /**
+     * Hands over the actions registered for the end of the request and forgets them, in reverse order of
+     * registration as the response actions are executed. Taken rather than read, so an action runs at most once
+     * however many times they are drained.
+     */
+    public Map<BasePolicy, Function<HttpExecutionContext, Completable>> drainOnTerminateActions() {
+        if (onTerminateActions == null || onTerminateActions.isEmpty()) {
+            return Map.of();
+        }
+        var entries = new ArrayList<>(onTerminateActions.entrySet());
+        onTerminateActions = null;
+        var reversed = new LinkedHashMap<BasePolicy, Function<HttpExecutionContext, Completable>>();
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            reversed.put(entries.get(i).getKey(), entries.get(i).getValue());
+        }
+        return reversed;
+    }
+
+    private void prepareTemplateEngine(final TemplateEngine templateEngine) {
+        final TemplateContext templateContext = templateEngine.getTemplateContext();
+        final EvaluableRequest evaluableReq = getEvaluableRequest();
+        final EvaluableResponse evaluableResp = getEvaluableResponse();
+        final EvaluableExecutionContext evaluableCtx = getEvaluableExecutionContext();
+
+        templateContext.setVariable(HttpPlainExecutionContext.TEMPLATE_ATTRIBUTE_REQUEST, evaluableReq);
+        templateContext.setVariable(HttpPlainExecutionContext.TEMPLATE_ATTRIBUTE_RESPONSE, evaluableResp);
+        templateContext.setVariable(HttpPlainExecutionContext.TEMPLATE_ATTRIBUTE_CONTEXT, evaluableCtx);
+    }
+
+    private EvaluableRequest getEvaluableRequest() {
+        if (evaluableRequest == null) {
+            this.evaluableRequest = new EvaluableRequest(request());
+        }
+        return evaluableRequest;
+    }
+
+    private EvaluableResponse getEvaluableResponse() {
+        if (evaluableResponse == null) {
+            this.evaluableResponse = new EvaluableResponse(response());
+        }
+        return evaluableResponse;
+    }
+
+    private EvaluableExecutionContext getEvaluableExecutionContext() {
+        if (evaluableExecutionContext == null) {
+            this.evaluableExecutionContext = new EvaluableExecutionContext(this);
+        }
+        return evaluableExecutionContext;
+    }
+}

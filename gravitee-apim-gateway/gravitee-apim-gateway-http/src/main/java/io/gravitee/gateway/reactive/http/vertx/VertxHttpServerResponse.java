@@ -1,0 +1,199 @@
+/*
+ * Copyright © 2015 The Gravitee team (http://gravitee.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.gravitee.gateway.reactive.http.vertx;
+
+import io.gravitee.common.http.HttpHeadersValues;
+import io.gravitee.common.http.HttpVersion;
+import io.gravitee.gateway.http.utils.RequestUtils;
+import io.gravitee.gateway.http.vertx.VertxHttpHeaders;
+import io.gravitee.gateway.reactive.api.context.http.HttpBaseExecutionContext;
+import io.gravitee.gateway.reactive.api.message.Message;
+import io.gravitee.gateway.reactive.core.context.AbstractResponse;
+import io.gravitee.gateway.reactive.http.vertx.VertxHttpServerRequest.UnconsumedBody;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpHeaders;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.rxjava3.core.http.HttpServerResponse;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicReference;
+import lombok.CustomLog;
+import org.reactivestreams.Subscription;
+
+/**
+ * @author Guillaume LAMIRAND (guillaume.lamirand at graviteesource.com)
+ * @author GraviteeSource Team
+ */
+@CustomLog
+public class VertxHttpServerResponse extends AbstractResponse {
+
+    protected final HttpServerResponse nativeResponse;
+    private final VertxHttpServerRequest vertxHttpServerRequest;
+    private Boolean isStreaming = null;
+
+    public VertxHttpServerResponse(final VertxHttpServerRequest vertxHttpServerRequest) {
+        this.nativeResponse = vertxHttpServerRequest.nativeRequest.response();
+        this.vertxHttpServerRequest = vertxHttpServerRequest;
+        this.headers = new VertxHttpHeaders(nativeResponse.headers());
+        this.trailers = new VertxHttpHeaders(nativeResponse.trailers());
+    }
+
+    public HttpServerResponse getNativeResponse() {
+        return nativeResponse;
+    }
+
+    public boolean opened() {
+        return !nativeResponse.closed() && !nativeResponse.ended();
+    }
+
+    @Override
+    public int status() {
+        return nativeResponse.getStatusCode();
+    }
+
+    @Override
+    public String reason() {
+        return nativeResponse.getStatusMessage();
+    }
+
+    @Override
+    public VertxHttpServerResponse reason(String reason) {
+        if (reason != null) {
+            nativeResponse.setStatusMessage(reason);
+        }
+        return this;
+    }
+
+    @Override
+    public VertxHttpServerResponse status(int statusCode) {
+        nativeResponse.setStatusCode(statusCode);
+        return this;
+    }
+
+    @Override
+    public boolean ended() {
+        return nativeResponse.ended();
+    }
+
+    @Override
+    public Completable end(final HttpBaseExecutionContext ctx) {
+        return Completable.defer(() -> {
+            if (vertxHttpServerRequest.isWebSocketUpgraded()) {
+                return chunks().ignoreElements();
+            }
+
+            if (!opened()) {
+                return Completable.error(new IllegalStateException("The response is already ended"));
+            }
+            prepareHeaders();
+            final UnconsumedBody unconsumedBody = vertxHttpServerRequest.unconsumedBody();
+            if (unconsumedBody == UnconsumedBody.DISCARD_THEN_CLOSE) {
+                // RFC 9112 §9.6: the client must not send another request on a connection about to be closed.
+                headers.set(io.vertx.core.http.HttpHeaders.CONNECTION, HttpHeadersValues.CONNECTION_CLOSE);
+            }
+
+            final AtomicReference<Subscription> subscriptionRef = new AtomicReference<>();
+
+            if (lazyBufferFlow().hasChunks()) {
+                return nativeResponse
+                    .rxSend(
+                        chunks()
+                            .doOnSubscribe(subscriptionRef::set)
+                            .map(buffer -> BufferInternal.buffer(buffer.getNativeBuffer()))
+                            .cast(Buffer.class)
+                            .doOnNext(buffer ->
+                                ctx.metrics().setResponseContentLength(ctx.metrics().getResponseContentLength() + buffer.length())
+                            )
+                    )
+                    .onErrorResumeNext(throwable -> {
+                        if (throwable instanceof IOException && ClientCloseClassifier.isClientConnectionClose(throwable)) {
+                            // The client closed the connection while the response was being streamed. The write
+                            // failure surfaces here BEFORE the connection-level handlers run, and completing below
+                            // makes the dispatch end normally — so the abort must be recorded on the metrics now with
+                            // its actual reason (TCP reset, broken pipe), or the request would be reported as a clean
+                            // success (APIM-12769).
+                            ClientCloseClassifier.decorate(ctx, throwable);
+                            ctx.withLogger(log).debug("Client has closed the connection: {}", throwable.getMessage());
+                        } else {
+                            ctx.withLogger(log).error("An error occurred while sending response chunks", throwable);
+                        }
+                        return Completable.complete();
+                    })
+                    .doOnComplete(() -> discardUnconsumedBody(ctx, unconsumedBody))
+                    .doOnDispose(() -> {
+                        if (!nativeResponse.ended()) {
+                            // If the response is disposed before being ended, we need to cancel the
+                            // subscription so cancellation is propagated to the endpoint connector.
+                            subscriptionRef.get().cancel();
+                        }
+                    });
+            }
+
+            return nativeResponse.rxEnd().doOnComplete(() -> discardUnconsumedBody(ctx, unconsumedBody));
+        });
+    }
+
+    @Override
+    public void messages(final Flowable<Message> messages) {
+        super.messages(messages);
+
+        // If message flow is set up, make sure any access to chunk buffers will not be
+        // possible anymore and returns empty.
+        chunks(Flowable.empty());
+    }
+
+    protected void prepareHeaders() {
+        if (!nativeResponse.headWritten()) {
+            if (HttpVersion.HTTP_2 == vertxHttpServerRequest.version()) {
+                if (
+                    headers.contains(io.vertx.core.http.HttpHeaders.CONNECTION) &&
+                    headers.getAll(io.vertx.core.http.HttpHeaders.CONNECTION).contains(HttpHeadersValues.CONNECTION_GO_AWAY)
+                ) {
+                    // 'Connection: goAway' is a special header indicating the native connection
+                    // should be shutdown because of the node itself will shutdown.
+                    vertxHttpServerRequest.nativeRequest.connection().shutdown();
+                }
+
+                // As per https://tools.ietf.org/html/rfc7540#section-8.1.2.2
+                // connection-specific header fields must be removed from response headers
+                headers
+                    .remove(io.vertx.core.http.HttpHeaders.CONNECTION)
+                    .remove(io.vertx.core.http.HttpHeaders.KEEP_ALIVE)
+                    .remove(io.vertx.core.http.HttpHeaders.TRANSFER_ENCODING);
+            }
+
+            if (headers.contains(HttpHeaders.CONTENT_LENGTH)) {
+                headers.remove(HttpHeaders.TRANSFER_ENCODING);
+            }
+        }
+    }
+
+    private void discardUnconsumedBody(final HttpBaseExecutionContext ctx, final UnconsumedBody unconsumedBody) {
+        if (unconsumedBody != UnconsumedBody.NONE) {
+            ctx.withLogger(log).debug("Response sent before the request body was read, discarding it ({})", unconsumedBody);
+            vertxHttpServerRequest.discardUnconsumedBody(unconsumedBody == UnconsumedBody.DISCARD_THEN_CLOSE);
+        }
+    }
+
+    @Override
+    public boolean isStreaming() {
+        if (isStreaming == null) {
+            isStreaming = RequestUtils.isStreaming(this.vertxHttpServerRequest, this);
+        }
+        return isStreaming;
+    }
+}
